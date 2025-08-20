@@ -13,7 +13,8 @@ __all__ = ["generic_thermal",
            "kunii_smith",
            "tsotsas",
            "argento",
-           "fei_narsilio"
+           "fei_narsilio",
+           "birkholz"
            ]
 
 
@@ -134,12 +135,10 @@ def yovanovitch(solid_p,
 
 
 def dixon_bridge_model(solid_p,
-                       pore_thermal_conductivity="pore.thermal_conductivity",
                        throat_solid_conductivity="throat.thermal_solid_conductivity",
                        throat_fluid_conductivity="throat.thermal_fluid_conductivity",
                        relative_bridge_radius="throat.relative_bridge_radius",
                        diameter="pore.diameter",
-                       mean_curvature="throat.mean_curvature",
                        throat_length="throat.length"
                        ):
     r"""
@@ -247,12 +246,10 @@ def dixon_bridge_model(solid_p,
 
 
 def extended_dixon_bridge_model(solid_p,
-                                pore_thermal_conductivity="pore.thermal_conductivity",
                                 throat_solid_conductivity="throat.thermal_solid_conductivity",
                                 throat_fluid_conductivity="throat.thermal_fluid_conductivity",
                                 relative_bridge_radius="throat.relative_bridge_radius",
                                 diameter="pore.diameter",
-                                mean_curvature="throat.mean_curvature",
                                 throat_length="throat.length"):
     r"""
     Parameters
@@ -264,10 +261,6 @@ def extended_dixon_bridge_model(solid_p,
         %(dict_burb)s throat thermal conductivity
     relative_bridge_radius : str
         %(dict_burb)s relative contact radius
-    mean_curvature : str
-        %(dict_burb)s mean curvature
-        Average curvature of the two particles in the proximity point of their contact point. Usually calculated
-        using formula:
 
         .. math::
 
@@ -362,7 +355,7 @@ def batchelor(solid_p,
               mean_curvature="throat.mean_curvature",
               relative_contact_radius="throat.relative_contact_throat_radius",
               throat_length="throat.length",
-              effective_mean_radius_curvature_fraction="throat.relative_mean_curvature_radius"
+              effective_mean_radius_curvature_fraction="throat.relative_mean_curvature"
               ):
     r"""
     Calculates conductance of the bridge model based on Batchelor, O'Brien 1977 model, presented by Yun and Evans (2010).
@@ -400,7 +393,7 @@ def batchelor(solid_p,
 
     if effective_mean_radius_curvature_fraction not in net.keys():
         net[effective_mean_radius_curvature_fraction] = 0.5
-        warnings.warn("No relative curvature fraction provided in solid phase. Using default value of 0.5")
+        warnings.warn("No 'throat.relative_mean_curvature' provided in solid phase. Using default value of 0.5")
 
     if relative_contact_radius not in net.keys():
         no_contact = True
@@ -456,7 +449,7 @@ def batchelor_old(solid_p,
                   throat_fluid_conductivity="throat.thermal_fluid_conductivity",
                   mean_curvature="throat.mean_curvature",
                   throat_length="throat.length",
-                  mean_radius_curvature_fraction="throat.relative_mean_curvature_radius"
+                  mean_radius_curvature_fraction="throat.relative_mean_curvature"
                   ):
     r"""
     /// DEPRECIATED
@@ -501,7 +494,7 @@ def batchelor_old(solid_p,
 
     if mean_radius_curvature_fraction not in net.keys():
         net[mean_radius_curvature_fraction] = 0.5
-        warnings.warn("No relative curvature fraction provided in solid phase. Using default value of 0.5")
+        warnings.warn("No 'throat.relative_mean_curvature' provided in solid phase. Using default value of 0.5")
 
 
     solid_conductivity = np.min(solid_p[pore_thermal_conductivity][net.conns], 1)
@@ -668,7 +661,6 @@ def fei_narsilio(solid_p,
                  relative_contact_radius="throat.relative_contact_throat_radius",
                  relative_bridge_radius="throat.relative_bridge_radius",
                  mean_curvature="throat.mean_curvature",
-                 throat_lenght="throat.length",
                  boundary_throats="throat.boundary",
                  diameter="pore.diameter"):
     def particle_conductance(_solid_conductivity, _particle_volume, _distance_to_conatct, _shape_factor):
@@ -682,7 +674,7 @@ def fei_narsilio(solid_p,
     def contact_conductance(_contact_radius, _contact_length, _roughness_coef, _solid_conductivity):
         _contact_area = np.pi * _contact_radius ** 2
         _conductance = _solid_conductivity * _roughness_coef * _contact_area / _contact_length
-        return 1 / _conductance
+        return _conductance
 
     net = solid_p.network
 
@@ -705,7 +697,8 @@ def fei_narsilio(solid_p,
 
     conductance = np.zeros_like(r1)
     for i, conns in enumerate(r1):
-        Cc = contact_conductance(contact_radius, net[mean_curvature] / 20, 0.9, solid_p[throat_solid_conductivity])
+        Cc = contact_conductance(contact_radius,  contact_radius, 0.9, solid_p[throat_solid_conductivity])
+        # contact length is arbitrary other option: net[mean_curvature] / 5
 
         if not net[boundary_throats][i]:
             _integral1 = integrate.quad(lambda r: gap_conductance_integral(r, r1[i], fluid_conductivity[i]),
@@ -731,3 +724,14 @@ def fei_narsilio(solid_p,
 
         conductance[i] = 1 / (1 / C1p + 1 / (Cg + Cc[i]) + 1 / C2p)
     return conductance
+
+
+def birkholz(solid_p,
+             relative_contact_radius="throat.relative_contact_throat_radius",
+             mean_curvature="throat.mean_curvature",
+             pore_thermal_conductivity="pore.thermal_conductivity",
+             ):
+
+    net = solid_p.network
+    solid_conductivities = solid_p[pore_thermal_conductivity][net.conns].T
+    return 4*net[mean_curvature]*net[relative_contact_radius]/(1/solid_conductivities[0]+1/solid_conductivities[1])

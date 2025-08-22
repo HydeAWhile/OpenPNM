@@ -62,12 +62,12 @@ class ThermalConductanceTest:
         actual = self.solid['throat.thermal_conductance'].mean()
         print(f" Average conductance Kunii is: {actual} W/K")
 
-    def test_tsotsas(self):
-        mod = op.models.physics.thermal_conductance.tsotsas
+    def test_tsotsas_bob(self):
+        mod = op.models.physics.thermal_conductance.tsotsas_bob
         self.solid.add_model(propname='throat.thermal_conductance', model=mod)
         self.solid.regenerate_models()
         actual = self.solid['throat.thermal_conductance'].mean()
-        print(f" Average conductance Tsotsas is: {actual} W/K")
+        print(f" Average conductance Tsotsas B-O'B is: {actual} W/K")
 
     def test_argento(self):
         mod = op.models.physics.thermal_conductance.argento
@@ -89,6 +89,20 @@ class ThermalConductanceTest:
         self.solid.regenerate_models()
         actual = self.solid['throat.thermal_conductance'].mean()
         print(f" Average conductance Birkholz is: {actual} W/K")
+
+    def test_zehner_bauer_schlunder(self):
+        mod = op.models.physics.thermal_conductance.zehner_bauer_schlunder
+        self.solid.add_model(propname='throat.thermal_conductance', model=mod)
+        self.solid.regenerate_models()
+        actual = self.solid['throat.thermal_conductance'].mean()
+        print(f" Average conductance Zehner Bauer Schlunder is: {actual} W/K")
+
+    def test_tsotsas_zbs(self):
+        mod = op.models.physics.thermal_conductance.tsotsas_zbs
+        self.solid.add_model(propname='throat.thermal_conductance', model=mod)
+        self.solid.regenerate_models()
+        actual = self.solid['throat.thermal_conductance'].mean()
+        print(f" Average conductance Tsotsas ZBS is: {actual} W/K")
 
 
 if __name__ == '__main__':

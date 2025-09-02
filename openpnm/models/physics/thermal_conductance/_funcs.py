@@ -528,8 +528,7 @@ def kunii_smith(solid_p,
                 throat_fluid_conductivity="throat.thermal_fluid_conductivity",
                 mean_curvature="throat.mean_curvature",
                 diameter="pore.diameter",
-                boundary_throats="throat.boundary",
-                n=1.45  # The number of contacts per hemisphere should be between 1.42 and 1.5
+                boundary_throats="throat.boundary"
                 ):
     r"""
     Calculates conductance of the bridge based on the contact model propsed by Kunii and Smith 1960
@@ -572,6 +571,7 @@ def kunii_smith(solid_p,
     particle_conductivities = solid_p[pore_thermal_conductivity][net.conns]
     # 2xN array with thermal conductivities of spheres bounding the throat, N is the number of throats
 
+    n = np.mean(net.num_neighbors(pores=net.Ps, flatten=False)[net.conns], axis=1) / 2
     costheta = np.sqrt(1 - 1 / n)
 
     contact_area = np.pi * net[mean_curvature] ** 2 * 1 / n
@@ -606,8 +606,8 @@ def kunii_smith(solid_p,
     r1, r2 = (net[diameter][net.conns] / 2).T
     resistance = np.zeros_like(contact_area)
     for i, conns in enumerate(net.conns):
-        particle_res = solid_resistance(r1[i], particle_conductivities[i][0], i)
-        resistance[i] = particle_res
+        # particle_res = solid_resistance(r1[i], particle_conductivities[i][0], i)
+        # resistance[i] = particle_res
         if not net[boundary_throats][i]:
             solid_res = solid_resistance(r2[i], particle_conductivities[i][1], i)
             resistance[i] += solid_res
@@ -794,7 +794,7 @@ def zehner_bauer_schlunder(solid_p,
                                        1 - flattening_coef) * rel_unit_cell_cunductivity))
 
     if return_conductance:
-        cross_section = np.pi * net[mean_curvature] ** 2
+        cross_section = (np.max((r1, r2)) * 2) ** 2
         length_throat = (r1 + r2)
 
         conductance = rel_throat_conductivity * solid_p[throat_fluid_conductivity] * cross_section / length_throat

@@ -11,6 +11,7 @@ from ._cubic import Cubic
 from ._demo import Demo
 from ._bcc import BodyCenteredCubic
 from ._fcc import FaceCenteredCubic
+from ._hcp import HexagonalClosePacked
 from ._cubic_template import CubicTemplate
 from ._delaunay_voronoi_dual import DelaunayVoronoiDual
 from ._voronoi import Voronoi

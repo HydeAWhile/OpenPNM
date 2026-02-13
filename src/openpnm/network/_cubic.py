@@ -128,3 +128,27 @@ class Cubic(Network):
             except KeyError:
                 msg = f"No pores labelled {label} found, skipping boundary addition"
                 logger.warning(msg)
+
+if __name__ == "__main__":
+    test = Cubic((4,4,3), spacing= [1, np.sqrt(3), 1], connectivity=6)
+    import matplotlib.pyplot as plt
+    coords = test.coords
+    connections = test.conns
+
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    zs = [c[2] for c in coords]
+
+    fig = plt.figure()
+    ax = fig.add_subplot(projection="3d")
+
+    ax.scatter(xs, ys, zs, c='blue', s=50)
+
+    for a, b in connections:
+        x_line = [coords[a][0], coords[b][0]]
+        y_line = [coords[a][1], coords[b][1]]
+        z_line = [coords[a][2], coords[b][2]]
+        ax.plot(x_line, y_line, z_line, c='red')
+
+    plt.show()
+    print("DONE")

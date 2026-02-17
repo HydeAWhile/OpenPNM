@@ -47,7 +47,7 @@ class FaceCenteredCubic(Network):
         if np.any(shape < 2):
             raise Exception('FCC lattice networks must have at least 2 '
                             'pores in all directions')
-        net = fcc(shape=shape, spacing=spacing,
+        net = fcc(shape=shape, spacing=1,
                   node_prefix='pore', edge_prefix='throat')
         self.update(net)
         # Add labels

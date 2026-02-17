@@ -38,7 +38,7 @@ class HexagonalClosePacked(Network):
         if np.any(shape < 2):
             raise Exception('HCP lattice networks must have at least 2 '
                             'pores in all directions')
-        net = hcp(shape=shape, spacing=spacing,
+        net = hcp(shape=shape, spacing=1,
                   node_prefix='pore', edge_prefix='throat')
         self.update(net)
         self._post_init()
@@ -81,14 +81,15 @@ class HexagonalClosePacked(Network):
             Ps = self.pores(item)
             coords = np.absolute(self['pore.coords'][Ps])
             axis = np.count_nonzero(np.diff(coords, axis=0), axis=0) == 0
-            offset = np.array(axis, dtype=int)/2
+            offset = np.array(axis, dtype=int)
             if np.amin(coords) == np.amin(coords[:, np.where(axis)[0]]):
                 offset = -1*offset
-            topotools.add_boundary_pores(network=self, pores=Ps, offset=offset,
+            topotools.add_boundary_pores(network=self, pores=Ps, offset=offset*spacing,
                                          apply_label=item + '_boundary')
 
 if __name__ == "__main__":
-    test = HexagonalClosePacked((4,4,3), spacing= 1)
+    test = HexagonalClosePacked((4,4,3), spacing= 1e-2)
+    test.add_boundary_pores(("top", "bottom"), spacing=1e-2)
     import matplotlib.pyplot as plt
     coords = test.coords
     connections = test.conns

@@ -78,7 +78,7 @@ def hcp(shape, spacing=1, mode='tri', node_prefix='node', edge_prefix='edge'):
     return d
 
 if __name__ == "__main__":
-    d = hcp((3,3,3))
+    d = hcp((3,3,3),0.01)
     import matplotlib.pyplot as plt
 
     coords = d["node.coords"]

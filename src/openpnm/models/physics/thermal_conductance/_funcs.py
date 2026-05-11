@@ -572,7 +572,7 @@ def kunii_smith(solid_p,
     # 2xN array with thermal conductivities of spheres bounding the throat, N is the number of throats
 
     n = np.mean(net.num_neighbors(pores=net.Ps, flatten=False)[net.conns], axis=1) / 2
-    costheta = np.sqrt(1 - 1 / n)
+    cos_theta = np.sqrt(1 - 1 / n)
 
     contact_area = np.pi * net[mean_curvature] ** 2 * 1 / n
     # Area influenced by the contacts
@@ -584,41 +584,10 @@ def kunii_smith(solid_p,
     # Original paper presumes same material, modified with the presumption, that lower conductivity influences the
     # system more.
 
-    fluid_film_thicknes = ((net[mean_curvature] * 2 * 1 / 2 * ((kappa - 1) / kappa) ** 2 * 1 / n) /
-                           (np.log(kappa - (kappa - 1) * costheta) - (kappa - 1) / kappa * (1 - costheta))
-                           * (2 / 3 * 1 / kappa))
+    conductance = (np.pi * net[mean_curvature] * solid_p[throat_fluid_conductivity] * (kappa/(kappa-1))**2 *
+                    np.log(kappa - (kappa - 1) * cos_theta) - (kappa - 1) / kappa * (1 - cos_theta))
 
-    def solid_resistance(particle_radius, solid_cond, ind):
-        return 2 * particle_radius * (2 / 3) / (solid_cond * contact_area[ind])
-
-    def fluid_resistance(ind):
-        return fluid_film_thicknes[ind] / (solid_p[throat_fluid_conductivity][ind] * contact_area[ind])
-
-    def boundary_resistance(boundary_dimension, radius_of_influence, solid_cond) -> float:
-        """
-            Modifying function not in the original publication.
-            Calculates resistance of the bidge, if one of the nodes is a boundary node (representing a wall)
-            :return: Resistance of the fluid gap, float, K/W
-            """
-        return boundary_dimension / (solid_cond * np.pi * radius_of_influence ** 2)
-        # return boundary_dimension/(boundary_conductivity*np.pi*r_bridge**2) # Overestimates resistance due to very thin cylinder
-
-    r1, r2 = (net[diameter][net.conns] / 2).T
-    resistance = np.zeros_like(contact_area)
-    for i, conns in enumerate(net.conns):
-        # particle_res = solid_resistance(r1[i], particle_conductivities[i][0], i)
-        # resistance[i] = particle_res
-        if not net[boundary_throats][i]:
-            solid_res = solid_resistance(r2[i], particle_conductivities[i][1], i)
-            resistance[i] += solid_res
-        else:
-            boundary_res = boundary_resistance(r1[i], r2[i], particle_conductivities[i][1])
-            resistance[i] += boundary_res
-
-        fluid_res = fluid_resistance(i)
-        resistance[i] += fluid_res
-
-    return 1 / resistance
+    return conductance
 
 
 def tsotsas_bob(solid_p,

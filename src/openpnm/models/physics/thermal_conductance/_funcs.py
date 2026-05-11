@@ -8,7 +8,7 @@ from scipy import integrate
 
 __all__ = ["generic_thermal",
            "series_resistors",
-           "yovanovitch",
+           "yovanovich",
            "dixon_bridge_model",
            "extended_dixon_bridge_model",
            "batchelor",
@@ -82,7 +82,7 @@ def series_resistors(
                                 size_factors=size_factors)
 
 
-def yovanovitch(solid_p,
+def yovanovich(solid_p,
                 throat_solid_conductivity="throat.thermal_solid_conductivity",
                 relative_contact_radius="throat.relative_contact_throat_radius",
                 mean_curvature="throat.mean_curvature",
@@ -90,7 +90,7 @@ def yovanovitch(solid_p,
                 radiation_exchange_factor=0
                 ):
     r"""
-    Calculates conductance based on Yovanovitch 1967 contact model. DOI: 10.2514/3.28821
+    Calculates conductance based on Yovanovich 1967 contact model. DOI: 10.2514/3.28821
     The model was original developed for thermal conductance thrpugh ball bearings in space.
     Currently, only conduction is implemented as the remaining resistances proved to be unreliabl. The parameter of
     relative gas contact radius remains a mystery.
@@ -138,115 +138,105 @@ def yovanovitch(solid_p,
     return (1 / solid_resistance)
 
 
-def dixon_bridge_model(solid_p,
-                       throat_solid_conductivity="throat.thermal_solid_conductivity",
-                       throat_fluid_conductivity="throat.thermal_fluid_conductivity",
-                       relative_bridge_radius="throat.relative_bridge_radius",
-                       diameter="pore.diameter",
-                       throat_length="throat.length"
-                       ):
+import warnings
+import numpy as np
+
+
+# ---Main chapter---
+def dixon_bridge_model(
+    solid_p,
+    throat_solid_conductivity="throat.thermal_solid_conductivity",
+    throat_fluid_conductivity="throat.thermal_fluid_conductivity",
+    relative_bridge_radius="throat.relative_bridge_radius",
+    diameter="pore.diameter",
+    throat_length="throat.length",
+):
     r"""
-    Calculates conductance based on Bridge model published by Dixon et al. 2013. DOI: 10.1016/j.compchemeng.2012.08.011
-    Problem of the model is that it requires the particles to be in very near contact,
-    as it does not include a term which would compensate for a larger gap.
+    Calculates conductance based on the Bridge model published by Dixon et al. (2013),
+    using a vectorized analytical solution for the radial integral.
 
-    Parameters
-    ----------
-    %(solid_p)s
-    pore_thermal_conductivity : str
-        %(dict_burb)s pore thermal conductivity
-    throat_solid_conductivity : str
-        %(dict_burb)s throat thermal conductivity
-    relative_bridge_radius : str
-        %(dict_burb)s relative contact radius
-    mean_curvature : str
-        %(dict_burb)s mean curvature
-        Average curvature of the two particles in the proximity point of their contact point. Usually calculated
-        using formula:
+    Notes
+    -----
+    The original implementation numerically evaluates, for each throat:
 
-        .. math::
+        I = ∫_0^{r_bridge} r / (h_f(r) * k_s + h_s(r) * k_f) dr
 
-            R = \frac{2 * R1 * R2}{R1 + R2}
-
-    throat_length : str
-        %(dict_burb)s throat length
-
-    diameter : str
-        %(dict_burb)s diameter
+    This version replaces that numerical quadrature with the closed-form solution.
 
     Returns
     -------
-    %(return_arr)s
-
+    ndarray
+        Thermal conductance of each throat [W/K].
     """
-
-    def h_f(r: float) -> float:
-        """
-        Calculates length of the fluid section of the bridge at given radius
-        :param r: _h_f = _h_f(r), float
-        :return: Distance _h_f, float
-        """
-        return r_particle[i] - np.sqrt(r_particle[i] ** 2 - r ** 2)
-
-    def h_s(length_fluid: float) -> float:
-        """
-        Calculates length of the solid section of the bridge at given radius
-        :param length_fluid: Size of the fluid part, float
-        :return: Distance _h_s, float
-        """
-        return length_bridge[i] - length_fluid
-
-    def integral(r) -> float:
-        """
-        Integrated function of the bridge model
-        :param length_bridge: Size of the bridge, float
-        :param r: f = f(r), float
-
-        :return: Integration function of the bridge model, float
-        """
-        _h_f = h_f(r)
-        _h_s = h_s(_h_f)
-        return r / (_h_f * solid_p[throat_solid_conductivity][i] + _h_s * solid_p[throat_fluid_conductivity][
-            i])  # Thermal conductivities factored ot before integral
-
     net = solid_p.network
 
-    # Checks, whether a contact radius value was inserted, if not, than
     if relative_bridge_radius not in net.keys():
         net[relative_bridge_radius] = 0.1
-        warnings.warn(f"No {relative_bridge_radius}) provided in solid phase. Using default value of 0.1")
+        warnings.warn(
+            f"No {relative_bridge_radius} provided in solid phase. "
+            f"Using default value of 0.1"
+        )
 
-    # Sets the particle radius as the smaller of the two nodes.
-    r_particle = np.min(net[diameter][net.conns], 1)
+    # Particle radius is taken as the smaller of the two connected pores
+    r_particle = np.min(net[diameter][net.conns], axis=1)
 
-    # Uses throar radius based on Batch O'Brien definition
-    # Calculates the bridge radius as fraction of the particle radius
+    # Bridge radius as a fraction of particle radius
     r_bridge = r_particle * net[relative_bridge_radius]
 
-    # Calculates bridge length to the symmetry plane
-    i = range(0, len(r_bridge))
-    length_bridge = h_f(r_bridge)
+    # Numerical safety: enforce 0 <= r_bridge <= r_particle
+    r_bridge = np.clip(r_bridge, 0.0, r_particle)
 
-    # Integates heat flux at different radia to get a total heat flow through the bridge
-    integral_value = np.empty_like(r_bridge)
-    for i, radius in enumerate(r_bridge):
-        _integral = integrate.quad(lambda r: integral(r), 0, radius)
-        integral_value[i] = _integral[0]
+    # Length from contact point to symmetry plane
+    # h_f(a) with a = r_bridge
+    # np.max is used to avoid sqrt of negative due to floating point issues when r_bridge is very close to r_particle
+    sqrt_term = np.sqrt(np.maximum(r_particle**2 - r_bridge**2, 0.0))
+    length_bridge = r_particle - sqrt_term
 
-    # Calculates effective conductivity based of the bridge (the model utilises half symmetry)
-    effective_conductivity = 2 * length_bridge / (r_bridge ** 2) * integral_value[:] * (
-            solid_p[throat_solid_conductivity] * solid_p[throat_fluid_conductivity])
-    # LAST BRACKET IS A CONSTANT FACTORED OUT FROM THE INTEGRAL
+    # Conductivities
+    k_s = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
+    k_f = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
 
-    # Sets the total length of the bridge as 2x the distance to the symmetry plane (only half in article!)
-    # + gap between particles
-    bridge_length = 2 * length_bridge + net[throat_length]
+    # Analytical integral from 0 to r_bridge
+    #
+    # I = L / (k_f - k_s)
+    #   + [k_f*L + (k_s - k_f)*R] / (k_f - k_s)^2 * ln(|k_s / k_f|)
+    #
+    # with special case k_f == k_s:
+    # I = r_bridge^2 / (2 * k_f * L)
+    integral_value = np.empty_like(r_bridge, dtype=float)
 
-    # Calculates the cross section of the bridge
-    bridge_crossection = np.pi * r_bridge ** 2
+    equal_k = np.isclose(k_f, k_s)
+    diff_k = ~equal_k
 
-    # Calculates the thermal conductacnce of the bridge in W/K
-    conductance = (effective_conductivity * bridge_crossection) / bridge_length
+    if np.any(diff_k):
+        B = k_f[diff_k] - k_s[diff_k]
+        R = r_particle[diff_k]
+        L = length_bridge[diff_k]
+        A = k_f[diff_k] * L + (k_s[diff_k] - k_f[diff_k]) * R
+
+        integral_value[diff_k] = (
+            L / B + (A / B**2) * np.log(np.abs(k_s[diff_k] / k_f[diff_k]))
+        )
+
+    if np.any(equal_k):
+        # When k_f == k_s, denominator becomes constant = k_f * length_bridge
+        # Use the limiting expression directly
+        integral_value[equal_k] = (
+            r_bridge[equal_k] ** 2 / (2.0 * k_f[equal_k] * length_bridge[equal_k])
+        )
+
+    # Total bridge length (full bridge = 2 * half-bridge + throat gap)
+    bridge_length = 2.0 * length_bridge + net[throat_length]
+
+    # Cross-sectional area
+    bridge_crosssection = np.pi * r_bridge**2
+
+    # Effective conductivity (same definition as original code)
+    effective_conductivity = 2.0 * length_bridge / (r_bridge**2) * integral_value * (k_s * k_f)
+
+    # Conductance [W/K]
+    conductance = effective_conductivity * bridge_crosssection / bridge_length
+
     return conductance
 
 

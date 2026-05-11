@@ -2,7 +2,6 @@ from openpnm.models.physics._utils import _poisson_conductance
 from openpnm.models import _doctxt
 import warnings
 import numpy as np
-from scipy import integrate
 
 __all__ = ["generic_thermal",
            "series_resistors",

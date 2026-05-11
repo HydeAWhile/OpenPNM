@@ -1,5 +1,3 @@
-from sympy.physics.units import length
-
 from openpnm.models.physics._utils import _poisson_conductance
 from openpnm.models import _doctxt
 import warnings
@@ -811,7 +809,7 @@ def fei_narsilio(solid_p,
     net = solid_p.network
 
     if relative_contact_radius not in net.keys():
-        solid_p[relative_contact_radius] = 0.009
+        net[relative_contact_radius] = 0.009
         warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
 
     if relative_bridge_radius not in net.keys():
@@ -863,10 +861,41 @@ def birkholz(solid_p,
              effective_radius="throat.effective_radius",
              pore_thermal_conductivity="pore.thermal_conductivity",
              ):
+
+    r"""
+    Calculate thermal conductance using the Birkholz contact model.
+
+    This model estimates the thermal conductance between two connected particles
+    from the effective radius, the relative contact radius, and the thermal
+    conductivities of the two connected pores. The two pore conductivities are
+    combined through the harmonic mean form appearing in the denominator.
+
+    Parameters
+    ----------
+    solid_p : OpenPNM phase-like object
+        Phase object containing pore-scale thermal conductivity data and a
+        reference to the associated network.
+    relative_contact_radius : str, optional
+        Dictionary key of the relative contact radius [-]. This quantity scales
+        the effective conductive contact size.
+    effective_radius : str, optional
+        Dictionary key of the effective radius [m].
+    pore_thermal_conductivity : str, optional
+        Dictionary key of the pore thermal conductivity values [W/m.K].
+
+    Returns
+    -------
+    ndarray
+        Thermal conductance of each throat [W/K].
+
+    If ``relative_contact_radius`` is not present in the network, a default
+    value of ``0.009`` is assigned and a warning is issued.
+    """
+
     net = solid_p.network
 
     if relative_contact_radius not in net.keys():
-        solid_p[relative_contact_radius] = 0.009
+        net[relative_contact_radius] = 0.009
         warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
 
     solid_conductivities = solid_p[pore_thermal_conductivity][net.conns].T
@@ -883,6 +912,73 @@ def zehner_bauer_schlunder(solid_p,
                            diameter="pore.diameter",
                            return_conductance=True
                            ):
+
+    r"""
+    Calculate effective throat conductivity or conductance using the
+    Zehner-Bauer-Schlünder (ZBS) model.
+
+    This model estimates the effective thermal transport through a two-phase
+    throat region composed of solid and fluid, based on the local porosity,
+    the ratio of solid to fluid thermal conductivity, and a flattening/contact
+    correction derived from the relative contact radius.
+
+    The function can return either:
+
+    - the thermal conductance of the throat [W/K], or
+    - the effective throat thermal conductivity [W/m.K] together with porosity.
+
+    Parameters
+    ----------
+    solid_p : OpenPNM phase-like object
+        Phase object containing throat-scale thermal conductivity data and a
+        reference to the associated network.
+    solid_volume : str, optional
+        Dictionary key of the solid volume assigned to each throat [m³].
+    fluid_volume : str, optional
+        Dictionary key of the fluid volume assigned to each throat [m³].
+    throat_solid_conductivity : str, optional
+        Dictionary key of the throat solid thermal conductivity values [W/m.K].
+    throat_fluid_conductivity : str, optional
+        Dictionary key of the throat fluid thermal conductivity values [W/m.K].
+    relative_contact_radius : str, optional
+        Dictionary key of the relative contact radius [-]. This quantity is used
+        to define the flattening coefficient in the model.
+    diameter : str, optional
+        Dictionary key of the pore diameter values [m].
+    return_conductance : bool, optional
+        If ``True``, return throat conductance [W/K]. If ``False``, return a
+        tuple containing effective throat conductivity [W/m.K] and porosity [-].
+
+    Returns
+    -------
+    ndarray
+        Thermal conductance of each throat [W/K], if ``return_conductance=True``.
+
+    tuple of ndarray
+        Effective throat conductivity [W/m.K] and porosity [-], if
+        ``return_conductance=False``.
+
+    Notes
+    -----
+    If ``solid_volume`` is not available, it is estimated as the sum of two
+    hemispherical particle volumes:
+
+    .. math::
+
+        V_s = \frac{2}{3}\pi r_1^3 + \frac{2}{3}\pi r_2^3
+
+    If ``fluid_volume`` is not available, the total unit-cell volume is
+    estimated from the larger connected particle diameter and the throat length
+    :math:`(r_1 + r_2)`, and the fluid volume is obtained by subtraction.
+
+    If ``return_conductance=True``, the throat conductance is obtained from the
+    effective throat conductivity, the cross-sectional area of the unit cell,
+    and the throat length.
+
+    If ``relative_contact_radius`` is not present in the network, a default
+    value of ``0.009`` is assigned and a warning is issued.
+    """
+
     net = solid_p.network
     r1, r2 = (net[diameter][net.conns] / 2).T
 
@@ -899,7 +995,7 @@ def zehner_bauer_schlunder(solid_p,
         total_volume = net[solid_volume] + net[fluid_volume]
 
     if relative_contact_radius not in net.keys():
-        solid_p[relative_contact_radius] = 0.009
+        net[relative_contact_radius] = 0.009
         warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
 
     flattening_coef = net[relative_contact_radius] ** 2
@@ -935,7 +1031,54 @@ def tsotsas_zbs(solid_p,
                 relative_contact_radius="throat.relative_contact_throat_radius",
                 diameter="pore.diameter",
                 effective_radius="throat.effective_radius"):
+    r"""
+    Calculate thermal conductance using the Tsotsas-ZBS model.
 
+    This model combines the effective throat conductivity obtained from the
+    Zehner-Bauer-Schlünder (ZBS) formulation with a geometric scaling based on
+    the solid throat volume, local porosity, and effective radius.
+
+    Parameters
+    ----------
+    solid_p : OpenPNM phase-like object
+        Phase object containing throat-scale thermal conductivity data and a
+        reference to the associated network.
+    solid_volume : str, optional
+        Dictionary key of the solid volume assigned to each throat [m³].
+    fluid_volume : str, optional
+        Dictionary key of the fluid volume assigned to each throat [m³].
+    throat_solid_conductivity : str, optional
+        Dictionary key of the throat solid thermal conductivity values [W/m.K].
+    throat_fluid_conductivity : str, optional
+        Dictionary key of the throat fluid thermal conductivity values [W/m.K].
+    relative_contact_radius : str, optional
+        Dictionary key of the relative contact radius [-].
+    diameter : str, optional
+        Dictionary key of the pore diameter values [m].
+    effective_radius : str, optional
+        Dictionary key of the effective radius [m].
+
+    Returns
+    -------
+    ndarray
+        Thermal conductance of each throat [W/K].
+
+    Notes
+    -------
+    If ``solid_volume`` is not available, it is estimated from the connected
+    particle diameters as the sum of two hemispherical volumes.
+
+    If ``fluid_volume`` is not available, it is estimated from the unit-cell
+    volume of the larger connected particle diameter minus the solid volume.
+
+    If ``relative_contact_radius`` is not present in the network, a default
+    value of ``0.009`` is assigned and a warning is issued.
+
+    See Also
+    --------
+    zehner_bauer_schlunder
+        Calculates the effective throat conductivity or conductance used by this model.
+    """
     net = solid_p.network
     r1, r2 = (net[diameter][net.conns] / 2).T
 
@@ -951,7 +1094,7 @@ def tsotsas_zbs(solid_p,
 
 
     if relative_contact_radius not in net.keys():
-        solid_p[relative_contact_radius] = 0.009
+        net[relative_contact_radius] = 0.009
         warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
 
     throat_conductivity, porosity = zehner_bauer_schlunder(solid_p,

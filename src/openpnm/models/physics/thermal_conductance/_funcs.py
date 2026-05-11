@@ -83,12 +83,12 @@ def series_resistors(
 
 
 def yovanovich(solid_p,
-                throat_solid_conductivity="throat.thermal_solid_conductivity",
-                relative_contact_radius="throat.relative_contact_throat_radius",
-                mean_curvature="throat.mean_curvature",
-                relative_gas_conductivity_radius=1e12,
-                radiation_exchange_factor=0
-                ):
+               throat_solid_conductivity="throat.thermal_solid_conductivity",
+               relative_contact_radius="throat.relative_contact_throat_radius",
+               effective_radius="throat.effective_radius",
+               relative_gas_conductivity_radius=1e12,
+               radiation_exchange_factor=0
+               ):
     r"""
     Calculates conductance based on Yovanovich 1967 contact model. DOI: 10.2514/3.28821
     The model was original developed for thermal conductance thrpugh ball bearings in space.
@@ -102,9 +102,9 @@ def yovanovich(solid_p,
         %(dict_burb)s pore thermal conductivity
     relative_contact_radius : str
         %(dict_burb)s relative contact radius
-    mean_curvature : str
-        %(dict_burb)s mean curvature
-        Average curvature of the two particles in the proximity point of their contact point. Usually calculated
+    effective_radius : str
+        %(dict_burb)s effective radius
+        Average radius of the two particles in the proximity point of their contact point. Usually calculated
         using formula:
 
         .. math::
@@ -129,11 +129,11 @@ def yovanovich(solid_p,
     #   relative_contact_radius ** 2 * (relative_gas_conductivity_radius ** 2 - 5.1 / relative_gas_conductivity_radius))
 
     # Calculates the radius of expected contact area
-    contact_radius = net[relative_contact_radius] * net[mean_curvature]
+    contact_radius = net[relative_contact_radius] * net[effective_radius]
 
     # calculates the resistance coming from the conduction through solid
     solid_resistance = 1 / (2 * solid_p[throat_solid_conductivity] * contact_radius) - np.log(2) / (
-            np.pi * solid_p[throat_solid_conductivity] * net[mean_curvature])
+            np.pi * solid_p[throat_solid_conductivity] * net[effective_radius])
 
     return (1 / solid_resistance)
 
@@ -461,16 +461,22 @@ def batchelor(solid_p,
               pore_thermal_conductivity="pore.thermal_conductivity",
               throat_solid_conductivity="throat.thermal_solid_conductivity",
               throat_fluid_conductivity="throat.thermal_fluid_conductivity",
-              mean_curvature="throat.mean_curvature",
+              effective_radius="throat.effective_radius",
               relative_contact_radius="throat.relative_contact_throat_radius",
               throat_length="throat.length",
-              effective_mean_radius_curvature_fraction="throat.relative_mean_curvature"
+              effective_radius_fraction="throat.relative_effective_radius"
               ):
     r"""
-    Calculates conductance of the bridge model based on Batchelor, O'Brien 1977 model, presented by Yun and Evans (2010).
-    They suggest  the fraction of the mean radius of curvature should be 0.5 for dry and 0.8 for wet conditions.
-    Value of 0.25 was used in the more recent article by Fei, Wenbin; Narsilio, Guillermo  10.1016/j.jrmge.2021.08.008.
+    Calculates conductance of the bridge model based on Batchelor, O'Brien 1977 model,
+    presented by Yun and Evans (2010).
+
+    They suggest the fraction of the effective radius of curvature should be 0.5 for dry
+    and 0.8 for wet conditions. Value of 0.25 was used in the more recent article by
+    Fei, Wenbin; Narsilio, Guillermo, DOI: 10.1016/j.jrmge.2021.08.008.
     They however used it for intra particle conductivity.
+
+    This implementation is fully vectorized and applies the contact / no-contact
+    rule elementwise for each throat.
 
     Parameters
     ----------
@@ -479,149 +485,136 @@ def batchelor(solid_p,
         %(dict_burb)s pore thermal conductivity
     throat_solid_conductivity : str
         %(dict_burb)s throat thermal conductivity
-    effective_mean_radius_curvature_fraction : str
-        %(dict_burb)s mean radius of curvature fraction
-    mean_curvature : str
+    throat_fluid_conductivity : str
+        %(dict_burb)s throat fluid thermal conductivity
+    effective_radius_fraction : str
+        %(dict_burb)s effective radius of curvature fraction
+    effective_radius : str
         %(dict_burb)s mean curvature
-        Average curvature of the two particles in the proximity point of their contact point. Usually calculated
-        using formula:
+        Average curvature of the two particles in the proximity point of their
+        contact point. Usually calculated using formula:
 
         .. math::
 
             R = \frac{2 * R1 * R2}{R1 + R2}
 
+    relative_contact_radius : str
+        %(dict_burb)s relative contact throat radius
     throat_length : str
         %(dict_burb)s throat length
 
     Returns
     -------
-    %(return_arr)s
-
+    ndarray
+        Conductance from the sphere to sphere  [W/K].
     """
     net = solid_p.network
 
-    if effective_mean_radius_curvature_fraction not in net.keys():
-        net[effective_mean_radius_curvature_fraction] = 0.5
+    if effective_radius_fraction not in net.keys():
+        net[effective_radius_fraction] = 0.5
         warnings.warn(
-            f"No {effective_mean_radius_curvature_fraction} provided in solid phase. Using default value of 0.5")
+            f"No {effective_radius_fraction} provided in solid phase. "
+            f"Using default value of 0.5"
+        )
 
+    # Input arrays
+    k_s_throat = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
+    k_f = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
+    conductivity_ratios = k_s_throat / k_f  # alpha in text
+
+    Rm = np.asarray(net[effective_radius], dtype=float)
+    frac = np.asarray(net[effective_radius_fraction], dtype=float)
+    Lt = np.asarray(net[throat_length], dtype=float)
+
+    effective_mean_particle_radius = Rm * frac
+
+    # Elementwise contact / no-contact logic
     if relative_contact_radius not in net.keys():
-        no_contact = True
-    #    elif solid_p[relative_contact_radius] <= 0:
-    #       no_contact = True DODELAT - potreba kontroly pro kazdy element
+        rel_contact = np.zeros_like(conductivity_ratios, dtype=float)
+        mask_no_contact = np.ones_like(conductivity_ratios, dtype=bool)
+        mask_contact = np.zeros_like(conductivity_ratios, dtype=bool)
     else:
-        no_contact = False
+        rel_contact = np.asarray(net[relative_contact_radius], dtype=float)
+        mask_no_contact = rel_contact <= 0.0
+        mask_contact = rel_contact > 0.0
 
-    conductivity_ratios = (solid_p[throat_solid_conductivity] /
-                           solid_p[throat_fluid_conductivity])  # alpha in text
-    effective_mean_particle_radius = net[mean_curvature] * net[effective_mean_radius_curvature_fraction]
+    # Contact-region conductance
+    Cc = np.zeros_like(conductivity_ratios, dtype=float)
 
-    Cc = np.zeros_like(conductivity_ratios)
-    C1p = np.zeros_like(conductivity_ratios)
-    C2p = np.zeros_like(conductivity_ratios)
-    if no_contact:
-        separation_parameters = np.square(conductivity_ratios) * net[throat_length] / net[
-            mean_curvature]  # lambda in text
-        for i, separation_param in enumerate(separation_parameters):
-            if separation_param < 0.1:
-                Cc[i] = (np.pi * solid_p[throat_fluid_conductivity][i] * net[mean_curvature][i] *
-                         np.log(conductivity_ratios[i] ** 2))
-            else:
-                Cc[i] = np.pi * solid_p[throat_fluid_conductivity][i] * net[mean_curvature][i] * np.log(
-                    1 + net[effective_mean_radius_curvature_fraction][i] ** 2 * net[mean_curvature][i] /
-                    net[throat_length][i])
+    # No-contact branch
+    separation_parameters = conductivity_ratios**2 * Lt / Rm
 
-    else:
-        beta = conductivity_ratios * net[relative_contact_radius]
-        for i, overlap_param in enumerate(beta):
-            if overlap_param < 1:
-                Cc[i] = np.pi * solid_p[throat_fluid_conductivity][i] * net[mean_curvature][i] * (
-                        0.17 * overlap_param ** 2 + np.log(conductivity_ratios[i] ** 2))
-            else:
-                Cc[i] = np.pi * solid_p[throat_fluid_conductivity][i] * net[mean_curvature][i] * (
-                        2 * overlap_param / np.pi - 2 * np.log(overlap_param) + np.log(conductivity_ratios[i] ** 2))
+    mask_no_contact_small = mask_no_contact & (separation_parameters < 0.1)
+    mask_no_contact_large = mask_no_contact & ~mask_no_contact_small
 
-    r1, r2 = (net['pore.diameter'][net.conns] / 2).T
+    Cc[mask_no_contact_small] = (
+        np.pi
+        * k_f[mask_no_contact_small]
+        * Rm[mask_no_contact_small]
+        * np.log(conductivity_ratios[mask_no_contact_small] ** 2)
+    )
+
+    Cc[mask_no_contact_large] = (
+        np.pi
+        * k_f[mask_no_contact_large]
+        * Rm[mask_no_contact_large]
+        * np.log(
+            1.0
+            + frac[mask_no_contact_large] ** 2
+            * Rm[mask_no_contact_large]
+            / Lt[mask_no_contact_large]
+        )
+    )
+
+    # Contact branch
+    beta = conductivity_ratios * rel_contact
+
+    mask_contact_small = mask_contact & (beta < 1.0)
+    mask_contact_large = mask_contact & ~mask_contact_small
+
+    Cc[mask_contact_small] = (
+        np.pi
+        * k_f[mask_contact_small]
+        * Rm[mask_contact_small]
+        * (
+            0.17 * beta[mask_contact_small] ** 2
+            + np.log(conductivity_ratios[mask_contact_small] ** 2)
+        )
+    )
+
+    Cc[mask_contact_large] = (
+        np.pi
+        * k_f[mask_contact_large]
+        * Rm[mask_contact_large]
+        * (
+            2.0 * beta[mask_contact_large] / np.pi
+            - 2.0 * np.log(beta[mask_contact_large])
+            + np.log(conductivity_ratios[mask_contact_large] ** 2)
+        )
+    )
+
+    # Particle-side conductances
+    r1, r2 = (net["pore.diameter"][net.conns] / 2.0).T
     solid_conductivities = solid_p[pore_thermal_conductivity][net.conns]
-    for i, solid_conductivity in enumerate(solid_conductivities):
-        C1p[i] = np.pi * solid_conductivity[0] * (effective_mean_particle_radius[i] *
-                                                  net[effective_mean_radius_curvature_fraction][i]) ** 2 / r1[i]
-        C2p[i] = np.pi * solid_conductivity[1] * (effective_mean_particle_radius[i] *
-                                                  net[effective_mean_radius_curvature_fraction][i]) ** 2 / r2[i]
 
-    conductance = 1 / (1 / C1p + 1 / Cc + 1 / C2p)
+    C1p = np.pi * solid_conductivities[:, 0] * (effective_mean_particle_radius * frac) ** 2 / r1
+    C2p = np.pi * solid_conductivities[:, 1] * (effective_mean_particle_radius * frac) ** 2 / r2
 
-    return conductance
+    # Series combination
+    R_total = np.zeros_like(Cc, dtype=float)
 
+    mask1 = C1p > 0.0
+    maskc = Cc > 0.0
+    mask2 = C2p > 0.0
 
-def batchelor_old(solid_p,
-                  pore_thermal_conductivity="pore.thermal_conductivity",
-                  throat_solid_conductivity="throat.thermal_conductivity",
-                  throat_fluid_conductivity="throat.thermal_fluid_conductivity",
-                  mean_curvature="throat.mean_curvature",
-                  throat_length="throat.length",
-                  mean_radius_curvature_fraction="throat.relative_mean_curvature"
-                  ):
-    r"""
-    /// DEPRECIATED
+    R_total[mask1] += 1.0 / C1p[mask1]
+    R_total[maskc] += 1.0 / Cc[maskc]
+    R_total[mask2] += 1.0 / C2p[mask2]
 
-    Calculates conductance of the bridge model based on Batchelor, O'Brien 1977 model, presented by Yun and Evans (2010).
-    They suggest  the fraction of the mean radius of curvature should be 0.5 for dry and 0.8 for wet conditions.
-    Value of 0.25 was used in the more recent article by Fei, Wenbin; Narsilio, Guillermo  10.1016/j.jrmge.2021.08.008.
-    They however used it for intra particle conductivity.
+    conductance = np.zeros_like(Cc, dtype=float)
+    valid = R_total > 0.0
+    conductance[valid] = 1.0 / R_total[valid]
 
-    Parameters
-    ----------
-    %(solid_p)s
-    pore_thermal_conductivity : str
-        %(dict_burb)s pore thermal conductivity
-    throat_thermal_conductivity : str
-        %(dict_burb)s throat thermal conductivity
-    mean_radius_curvature_fraction : str
-        %(dict_burb)s mean radius of curvature fraction
-    mean_curvature : str
-        %(dict_burb)s mean curvature
-        Average curvature of the two particles in the proximity point of their contact point. Usually calculated
-        using formula:
-
-        .. math::
-
-            R = \frac{2 * R1 * R2}{R1 + R2}
-
-    throat_length : str
-        %(dict_burb)s throat length
-
-    %(fluid_p)s
-    throat_thermal_conductivity : str
-        %(dict_burb)s thermal conductivity
-
-    Returns
-    -------
-    %(return_arr)s
-
-    """
-
-    net = solid_p.network
-
-    if mean_radius_curvature_fraction not in net.keys():
-        net[mean_radius_curvature_fraction] = 0.5
-        warnings.warn("No 'throat.relative_mean_curvature' provided in solid phase. Using default value of 0.5")
-
-    solid_conductivity = np.min(solid_p[pore_thermal_conductivity][net.conns], 1)
-
-    conductivity_ratios = solid_conductivity / solid_p[throat_fluid_conductivity]
-
-    separation_parameters = np.power(conductivity_ratios, 2) * net[throat_length] / net[mean_curvature]
-    conductance = np.empty_like(separation_parameters)
-    for i, sep_param in enumerate(separation_parameters):
-        if sep_param < 0.1:
-            conductance[i] = np.pi * solid_p[throat_solid_conductivity][i] * net[mean_curvature][
-                i] * np.log(conductivity_ratios[i])
-        else:
-            print(i)
-            conductance[i] = (np.pi * solid_p[throat_solid_conductivity][i] * net[mean_curvature][i]
-                              * np.log(1 + net[mean_radius_curvature_fraction] ** 2 * net[mean_curvature][i] /
-                                       net[throat_length][i]))
     return conductance
 
 
@@ -629,7 +622,7 @@ def kunii_smith(solid_p,
                 pore_thermal_conductivity="pore.thermal_conductivity",
                 throat_solid_conductivity="throat.thermal_solid_conductivity",
                 throat_fluid_conductivity="throat.thermal_fluid_conductivity",
-                mean_curvature="throat.mean_curvature",
+                effective_radius="throat.effective_radius",
                 diameter="pore.diameter",
                 boundary_throats="throat.boundary"
                 ):
@@ -646,9 +639,9 @@ def kunii_smith(solid_p,
         %(dict_burb)s pore thermal conductivity
     throat_thermal_conductivity : str
         %(dict_burb)s throat thermal conductivity
-    mean_curvature : str
-        %(dict_burb)s mean curvature
-        Average curvature of the two particles in the proximity point of their contact point. Usually calculated
+    effective_radius : str
+        %(dict_burb)s effective radius
+        Average radius of the two particles in the proximity point of their contact point. Usually calculated
         using formula:
 
         .. math::
@@ -671,42 +664,68 @@ def kunii_smith(solid_p,
     """
     net = solid_p.network
     # local declaration of the general particle network
-    particle_conductivities = solid_p[pore_thermal_conductivity][net.conns]
-    # 2xN array with thermal conductivities of spheres bounding the throat, N is the number of throats
 
     n = np.mean(net.num_neighbors(pores=net.Ps, flatten=False)[net.conns], axis=1) / 2
     cos_theta = np.sqrt(1 - 1 / n)
-
-    contact_area = np.pi * net[mean_curvature] ** 2 * 1 / n
-    # Area influenced by the contacts
     # sin2(theta) substituted by 1/n.
-    # Original paper presumes particles of same size, Batchelors mean curvature was thought to
-    # better represent this parameter.
 
     kappa = solid_p[throat_solid_conductivity] / solid_p[throat_fluid_conductivity]
     # Original paper presumes same material, modified with the presumption, that lower conductivity influences the
     # system more.
 
-    conductance = (np.pi * net[mean_curvature] * solid_p[throat_fluid_conductivity] * (kappa/(kappa-1))**2 *
-                    np.log(kappa - (kappa - 1) * cos_theta) - (kappa - 1) / kappa * (1 - cos_theta))
+    conductance = (np.pi * net[effective_radius] * solid_p[throat_fluid_conductivity] * (kappa / (kappa - 1)) ** 2 *
+                   np.log(kappa - (kappa - 1) * cos_theta) - (kappa - 1) / kappa * (1 - cos_theta))
 
     return conductance
 
 
+
 def tsotsas_bob(solid_p,
-            throat_solid_conductivity="throat.thermal_solid_conductivity",
-            relative_contact_radius="throat.relative_contact_throat_radius",
-            mean_curvature="throat.mean_curvature"):
+                throat_solid_conductivity="throat.thermal_solid_conductivity",
+                relative_contact_radius="throat.relative_contact_throat_radius",
+                effective_radius="throat.effective_radius"):
+    r"""
+    Calculate thermal conductance using the Tsotsas-Bob simplified contact model.
+
+    This model estimates the thermal conductance through a particle contact based
+    on the throat solid thermal conductivity, the effective particle radius, and
+    the relative contact radius. The conductance is evaluated from the contact
+    cross-sectional area and a characteristic conduction length proportional to
+    the effective radius.
+
+    Parameters
+    ----------
+    solid_p : OpenPNM phase-like object
+        Phase object containing throat-scale thermal conductivity data and a
+        reference to the associated network.
+    throat_solid_conductivity : str, optional
+        Dictionary key of the throat solid thermal conductivity values [W/m.K].
+    relative_contact_radius : str, optional
+        Dictionary key of the relative contact radius [-]. This quantity scales
+        the contact conductance and represents the characteristic contact size
+        relative to the particle size.
+    effective_radius : str, optional
+        Dictionary key of the effective particle radius [m].
+
+    Returns
+    -------
+    ndarray
+        Thermal conductance of each throat [W/K].
+
+    If ``relative_contact_radius`` is not present in the network, a default
+    value of ``0.009`` is assigned and a warning is issued.
+    """
+
     net = solid_p.network
 
     if relative_contact_radius not in net.keys():
         net[relative_contact_radius] = 0.009
         warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
 
-    particle_cross_section = np.pi * np.square(net[mean_curvature])
+    particle_cross_section = np.pi * np.square(net[effective_radius])
 
     conductance = (net[relative_contact_radius]) * solid_p[throat_solid_conductivity] / (
-            2 * np.pi * net[mean_curvature]) * particle_cross_section
+            2 * np.pi * net[effective_radius]) * particle_cross_section
 
     return conductance
 
@@ -714,8 +733,41 @@ def tsotsas_bob(solid_p,
 def argento(solid_p,
             throat_solid_conductivity="throat.thermal_solid_conductivity",
             relative_contact_radius="throat.relative_contact_throat_radius",
-            mean_curvature="throat.mean_curvature",
+            effective_radius="throat.effective_radius",
             throat_lenght="throat.length"):
+    r"""
+    Calculate thermal conductance using the Argento contact-bridge model.
+
+    This model estimates the thermal conductance through a particle bridge based
+    on the throat solid thermal conductivity, the effective particle radius, the
+    relative contact radius, and the total bridge length. The bridge length is
+    defined as the throat length plus one half of each connected particle
+    diameter.
+
+    Parameters
+    ----------
+    solid_p : OpenPNM phase-like object
+        Phase object containing throat-scale thermal conductivity data and a
+        reference to the associated network.
+    throat_solid_conductivity : str, optional
+        Dictionary key of the throat solid thermal conductivity values [W/m.K].
+    relative_contact_radius : str, optional
+        Dictionary key of the relative contact radius [-]. This quantity scales
+        the conductive bridge area.
+    effective_radius : str, optional
+        Dictionary key of the effective particle radius [m].
+    throat_lenght : str, optional
+        Dictionary key of the throat length [m].
+
+    Returns
+    -------
+    ndarray
+        Thermal conductance of each throat [W/K].
+
+    If ``relative_contact_radius`` is not present in the network, a default
+    value of ``0.009`` is assigned and a warning is issued.
+    """
+
     net = solid_p.network
 
     if relative_contact_radius not in net.keys():
@@ -724,7 +776,7 @@ def argento(solid_p,
 
     bridge_len = net[throat_lenght] + np.sum((net['pore.diameter'][net.conns] / 2), axis=1)
 
-    particle_cross_section = np.pi * np.square(net[mean_curvature])
+    particle_cross_section = np.pi * np.square(net[effective_radius])
     resistance = 0.889 / (
             net[relative_contact_radius] * solid_p[throat_solid_conductivity] * particle_cross_section) * bridge_len
 
@@ -739,9 +791,10 @@ def fei_narsilio(solid_p,
                  throat_fluid_conductivity="throat.thermal_fluid_conductivity",
                  relative_contact_radius="throat.relative_contact_throat_radius",
                  relative_bridge_radius="throat.relative_bridge_radius",
-                 mean_curvature="throat.mean_curvature",
+                 effective_radius="throat.effective_radius",
                  boundary_throats="throat.boundary",
                  diameter="pore.diameter"):
+
     def particle_conductance(_solid_conductivity, _particle_volume, _distance_to_conatct, _shape_factor):
         _conductance = _solid_conductivity * _shape_factor * _particle_volume / _distance_to_conatct ** 2
         return _conductance
@@ -769,15 +822,15 @@ def fei_narsilio(solid_p,
     solid_conductivities = solid_p[pore_thermal_conductivity][net.conns]
     shape_factor = 1 / net.num_neighbors(pores=net.Ps, flatten=False)
     r1, r2 = (net[diameter][net.conns] / 2).T
-    bridge_radius = net[mean_curvature] * net[relative_bridge_radius]
-    contact_radius = net[mean_curvature] * net[relative_contact_radius]
+    bridge_radius = net[effective_radius] * net[relative_bridge_radius]
+    contact_radius = net[effective_radius] * net[relative_contact_radius]
     particle_volume1 = 4 / 3 * np.pi * r1 ** 3
     particle_volume2 = 4 / 3 * np.pi * r2 ** 3
 
     conductance = np.zeros_like(r1)
     for i, conns in enumerate(r1):
         Cc = contact_conductance(contact_radius, contact_radius, 0.9, solid_p[throat_solid_conductivity])
-        # contact length is arbitrary other option: net[mean_curvature] / 5
+        # contact length is arbitrary other option: net[effective_radius] / 5
 
         if not net[boundary_throats][i]:
             _integral1 = integrate.quad(lambda r: gap_conductance_integral(r, r1[i], fluid_conductivity[i]),
@@ -798,7 +851,7 @@ def fei_narsilio(solid_p,
 
             poreid = net.conns[i]
 
-            C1p = particle_conductance(solid_conductivities[i, 0], particle_volume1[i], r1[i], poreid[0])
+            C1p = particle_conductance(solid_conductivities[i, 0], particle_volume1[i], r1[i], shape_factor[poreid[0]])
             C2p = particle_conductance(solid_conductivities[i, 1], particle_volume2[i], r2[i], 1)
 
         conductance[i] = 1 / (1 / C1p + 1 / (Cg + Cc[i]) + 1 / C2p)
@@ -807,7 +860,7 @@ def fei_narsilio(solid_p,
 
 def birkholz(solid_p,
              relative_contact_radius="throat.relative_contact_throat_radius",
-             mean_curvature="throat.mean_curvature",
+             effective_radius="throat.effective_radius",
              pore_thermal_conductivity="pore.thermal_conductivity",
              ):
     net = solid_p.network
@@ -817,7 +870,7 @@ def birkholz(solid_p,
         warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
 
     solid_conductivities = solid_p[pore_thermal_conductivity][net.conns].T
-    return 4 * net[mean_curvature] * net[relative_contact_radius] / (
+    return 4 * net[effective_radius] * net[relative_contact_radius] / (
             1 / solid_conductivities[0] + 1 / solid_conductivities[1])
 
 
@@ -828,7 +881,6 @@ def zehner_bauer_schlunder(solid_p,
                            throat_fluid_conductivity="throat.thermal_fluid_conductivity",
                            relative_contact_radius="throat.relative_contact_throat_radius",
                            diameter="pore.diameter",
-                           mean_curvature="throat.mean_curvature",
                            return_conductance=True
                            ):
     net = solid_p.network
@@ -882,7 +934,7 @@ def tsotsas_zbs(solid_p,
                 throat_fluid_conductivity="throat.thermal_fluid_conductivity",
                 relative_contact_radius="throat.relative_contact_throat_radius",
                 diameter="pore.diameter",
-                mean_curvature="throat.mean_curvature"):
+                effective_radius="throat.effective_radius"):
 
     net = solid_p.network
     r1, r2 = (net[diameter][net.conns] / 2).T
@@ -903,15 +955,14 @@ def tsotsas_zbs(solid_p,
         warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
 
     throat_conductivity, porosity = zehner_bauer_schlunder(solid_p,
-                                                 solid_volume,
-                                                 fluid_volume,
-                                                 throat_solid_conductivity,
-                                                 throat_fluid_conductivity,
-                                                 relative_contact_radius,
-                                                 diameter,
-                                                 mean_curvature,
-                                                 False)
+                                                           solid_volume,
+                                                           fluid_volume,
+                                                           throat_solid_conductivity,
+                                                           throat_fluid_conductivity,
+                                                           relative_contact_radius,
+                                                           diameter,
+                                                           False)
 
-    return net[solid_volume]/(4*(1-porosity)*net[mean_curvature]**2)*throat_conductivity
+    return net[solid_volume]/(4 * (1-porosity) * net[effective_radius] ** 2)*throat_conductivity
 
 

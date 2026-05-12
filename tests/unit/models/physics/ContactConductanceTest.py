@@ -403,12 +403,9 @@ class TestThermalConductanceGoldenMaster:
                 "model": tc.kunii_smith,
                 "kwargs": self._alias_kwargs(
                     "kunii_smith",
-                    pore_thermal_conductivity="pore.thermal_conductivity",
                     throat_solid_conductivity="throat.thermal_solid_conductivity",
                     throat_fluid_conductivity="throat.thermal_fluid_conductivity",
                     effective_radius="throat.effective_radius",
-                    diameter="pore.diameter",
-                    boundary_throats="throat.boundary",
                 ),
             },
             "tsotsas_bob": {

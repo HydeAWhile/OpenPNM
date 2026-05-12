@@ -15,7 +15,8 @@ __all__ = ["generic_thermal",
            "fei_narsilio",
            "birkholz",
            "zehner_bauer_schlunder",
-           "tsotsas_zbs"
+           "tsotsas_zbs",
+           "bahrami_rough_joint",
            ]
 
 
@@ -135,7 +136,6 @@ def yovanovich(solid_p,
     return (1 / solid_resistance)
 
 
-# ---Main chapter---
 def dixon_bridge_model(
     solid_p,
     throat_solid_conductivity="throat.thermal_solid_conductivity",
@@ -298,7 +298,6 @@ def extended_dixon_bridge_model(
     of ``0.1`` is assigned and a warning is issued.
     """
 
-    # ---Main chapter---
     def _single_sphere_bridge_conductance(r_particle, r_bridge, k_s, k_f):
         """
         Analytical conductance of one sphere-side bridge segment.
@@ -377,7 +376,6 @@ def extended_dixon_bridge_model(
 
     net = solid_p.network
 
-    # ---Main chapter---
     if relative_bridge_radius not in net.keys():
         net[relative_bridge_radius] = 0.1
         warnings.warn(
@@ -387,7 +385,6 @@ def extended_dixon_bridge_model(
 
     conns = net.conns
 
-    # ---Main chapter---
     # Particle size on each connected side
     r1 = np.asarray(net[diameter][conns[:, 0]], dtype=float)/2
     r2 = np.asarray(net[diameter][conns[:, 1]], dtype=float)/2
@@ -404,7 +401,6 @@ def extended_dixon_bridge_model(
     kf = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
     Lt = np.asarray(net[throat_length], dtype=float)
 
-    # ---Main chapter---
     # Sphere-side bridge conductances
     G1 = _single_sphere_bridge_conductance(
         r_particle=r1,
@@ -419,8 +415,6 @@ def extended_dixon_bridge_model(
         k_s=ks2,
         k_f=kf,
     )
-
-    # ---Main chapter---
 
     # Fluid gap conductance through a cylindrical throat region
     area = np.pi * r_bridge ** 2
@@ -615,65 +609,86 @@ def batchelor(solid_p,
     return conductance
 
 
-def kunii_smith(solid_p,
-                pore_thermal_conductivity="pore.thermal_conductivity",
-                throat_solid_conductivity="throat.thermal_solid_conductivity",
-                throat_fluid_conductivity="throat.thermal_fluid_conductivity",
-                effective_radius="throat.effective_radius",
-                diameter="pore.diameter",
-                boundary_throats="throat.boundary"
-                ):
+
+def kunii_smith(
+    solid_p,
+    throat_solid_conductivity="throat.thermal_solid_conductivity",
+    throat_fluid_conductivity="throat.thermal_fluid_conductivity",
+    effective_radius="throat.effective_radius",
+):
     r"""
-    Calculates conductance of the bridge based on the contact model propsed by Kunii and Smith 1960
-    DOI: 10.1002/aic.690060115.
-    The model combines 2 resistances: Resistance of a cylinder equivalent to a pore represnetd by a sphere.
-    and a resistance of boundary fluid in the proximity of the contact point.
+    Calculates conductance of the bridge based on the Kunii and Smith (1960)
+    contact model, adapted here as a throat-level conductance model for OpenPNM.
 
-    Parameters
-    ----------
-    %(solid_p)s
-    pore_thermal_conductivity : str
-        %(dict_burb)s pore thermal conductivity
-    throat_thermal_conductivity : str
-        %(dict_burb)s throat thermal conductivity
-    effective_radius : str
-        %(dict_burb)s effective radius
-        Average radius of the two particles in the proximity point of their contact point. Usually calculated
-        using formula:
+    Notes
+    -----
+    This implementation keeps the existing OpenPNM interpretation in which:
+      - the contact-count quantity is approximated from local network coordination
+      - the particle radius appearing in the paper is represented by
+        ``throat.effective_radius``
 
-        .. math::
-
-            R = \frac{2 * R1 * R2}{R1 + R2}
-
-    diameter : str
-        %(dict_burb)s diameter
-    boundary_throats : str
-        %(dict_burb)s boundary throats
-
-    %(fluid_p)s
-    throat_thermal_conductivity : str
-        %(dict_burb)s thermal conductivity
+    The original paper presents Eq. (11) as the heat flow through one contact
+    region between particles, and then uses it in a packed-bed-scale derivation.
+    Here that expression is used directly as a throat conductance model.
 
     Returns
     -------
-    %(return_arr)s
-
+    ndarray
+        Conductance from sphere to sphere [W/kappa].
     """
     net = solid_p.network
-    # local declaration of the general particle network
 
-    n = np.mean(net.num_neighbors(pores=net.Ps, flatten=False)[net.conns], axis=1) / 2
-    cos_theta = np.sqrt(1 - 1 / n)
-    # sin2(theta) substituted by 1/n.
+    # Approximate contact-count surrogate from local coordination
+    n = np.mean(net.num_neighbors(pores=net.Ps, flatten=False)[net.conns], axis=1) / 2.0
 
-    kappa = solid_p[throat_solid_conductivity] / solid_p[throat_fluid_conductivity]
-    # Original paper presumes same material, modified with the presumption, that lower conductivity influences the
-    # system more.
+    # Guard against invalid/degenerate coordination values
+    n = np.asarray(n, dtype=float)
+    n = np.maximum(n, 1.0 + 1e-12)
 
-    conductance = (np.pi * net[effective_radius] * solid_p[throat_fluid_conductivity] * (kappa / (kappa - 1)) ** 2 *
-                   np.log(kappa - (kappa - 1) * cos_theta) - (kappa - 1) / kappa * (1 - cos_theta))
+    # In the paper, sin^2(theta_0) = 1 / n  ->  cos(theta_0) = sqrt(1 - 1/n)
+    cos_theta = np.sqrt(np.maximum(1.0 - 1.0 / n, 0.0))
 
-    return conductance
+    # Conductivity ratio kappa = k_s / k_f
+    k_s = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
+    k_f = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
+    R_eff = np.asarray(net[effective_radius], dtype=float)
+
+    conductance = np.zeros_like(k_f, dtype=float)
+
+    # Valid positive entries only
+    valid = (k_s > 0.0) & (k_f > 0.0) & (R_eff > 0.0)
+    if not np.any(valid):
+        return conductance
+
+    kappa = np.zeros_like(k_f, dtype=float)
+    kappa[valid] = k_s[valid] / k_f[valid]
+
+    # Handle kappa ~= 1 with the analytical limit:
+    # lim_{kappa->1} (kappa/(kappa-1))^2 * [ ln(kappa - (kappa-1)cos(theta))
+    #                           - ((kappa-1)/kappa)(1-cos(theta)) ]
+    # = (1 - cos(theta)^2) / 2
+    equal_mask = valid & np.isclose(kappa, 1.0, rtol=1e-8, atol=1e-12)
+    if np.any(equal_mask):
+        bracket = 0.5 * (1.0 - cos_theta[equal_mask] ** 2)
+        conductance[equal_mask] = np.pi * R_eff[equal_mask] * k_f[equal_mask] * bracket
+
+    # General case
+    diff_mask = valid & ~np.isclose(kappa, 1.0, rtol=1e-8, atol=1e-12)
+    if np.any(diff_mask):
+        Kd = kappa[diff_mask]
+        c = cos_theta[diff_mask]
+
+        bracket = (Kd / (Kd - 1.0)) ** 2 * (
+            np.log(Kd - (Kd - 1.0) * c)
+            - ((Kd - 1.0) / Kd) * (1.0 - c)
+        )
+
+        conductance[diff_mask] = (
+            np.pi * R_eff[diff_mask] * k_f[diff_mask] * bracket
+        )
+
+    # Small negative values can appear from floating-point noise
+    return np.maximum(conductance, 0.0)
 
 
 
@@ -845,11 +860,9 @@ def fei_narsilio(solid_p,
     ``0.1`` is used.
     """
 
-    # ---Main chapter---
     def particle_conductance(_solid_conductivity, _particle_volume, _distance_to_contact, _shape_factor):
         return _solid_conductivity * _shape_factor * _particle_volume / _distance_to_contact**2
 
-    # ---Main chapter---
     def gap_conductance_closed_form(lower_radius, upper_radius, particle_radius, _fluid_conductivity):
         """
         Analytical value of:

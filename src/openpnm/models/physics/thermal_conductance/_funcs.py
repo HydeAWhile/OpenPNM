@@ -1282,3 +1282,351 @@ def tsotsas_zbs(solid_p,
     return net[solid_volume]/(4 * (1-porosity) * net[effective_radius] ** 2)*throat_conductivity
 
 
+def bahrami_rough_joint(
+    solid_p,
+    pore_solid_conductivity="pore.thermal_conductivity",
+    throat_fluid_conductivity="throat.thermal_fluid_conductivity",
+    effective_radius="throat.effective_radius",
+    diameter="pore.diameter",
+    normal_force="throat.normal_force",
+    effective_elastic_modulus="throat.effective_elastic_modulus",
+    roughness="throat.roughness",
+    asperity_slope="throat.asperity_slope",
+    microhardness="throat.microhardness",
+    vickers_c1="throat.vickers_c1",
+    vickers_c2="throat.vickers_c2",
+    gas_pressure="throat.gas_pressure",
+    gas_temperature="throat.gas_temperature",
+    accommodation_coefficient="throat.accommodation_coefficient",
+    gas_specific_heat_ratio="throat.gas_specific_heat_ratio",
+    gas_prandtl="throat.gas_prandtl",
+    gas_mean_free_path_ref="throat.gas_mean_free_path_ref",
+    reference_pressure=101325.0,
+    reference_temperature=273.15,
+    macro_gap_outer_radius=None,
+    integration_points=200,
+):
+    r"""
+    Calculate throat thermal conductance using the rough-sphere joint model
+    of Bahrami, Yovanovich, and Culham (IJHMT 49, 2006, 3691-3701).
+
+    This implementation returns the conductance of a *single contact region*
+    between two rough spheres (or a rough-sphere approximation for a throat).
+    It follows the resistance network:
+
+        R_j = [ 1 / ( R_L + (R_s || R_g) ) + 1 / R_G ]^(-1)
+
+    where:
+      - R_s : microcontact solid conduction resistance
+      - R_L : macrocontact constriction/spreading resistance
+      - R_g : gas conduction in the microgap
+      - R_G : gas conduction in the macrogap
+
+    Notes
+    -----
+    1. If `throat.microhardness` is not provided, the function falls back to
+       `throat.vickers_c1` and `throat.vickers_c2` using the correlation
+       form reported in the paper.
+    2. If `macro_gap_outer_radius` is not supplied, the model uses the smaller
+       connected pore radius as the outer limit of the macrogap integration.
+       This is the closest throat-scale analogue of the SC basic-cell geometry.
+    4. The paper gives a closed-form expression for R_G, but to make the
+       implementation robust and easier to maintain, this version evaluates
+       the same macrogap contribution by direct radial integration.
+
+    Parameters
+    ----------
+    solid_p : OpenPNM phase-like object
+        Phase object containing thermal properties and a reference to the
+        associated network.
+    pore_solid_conductivity : str
+        Key to pore-scale solid thermal conductivity [W/m.K].
+    throat_fluid_conductivity : str
+        Key to throat-scale gas/fluid thermal conductivity [W/m.K].
+    effective_radius : str
+        Key to effective radius of curvature [m].
+    diameter : str
+        Key to pore diameter [m].
+    normal_force : str
+        Key to normal contact force per throat [N].
+    effective_elastic_modulus : str
+        Key to effective elastic modulus E' [Pa].
+    roughness : str
+        Key to combined RMS roughness sigma [m].
+    asperity_slope : str
+        Key to combined asperity slope m [-].
+    microhardness : str
+        Key to effective microhardness H_mic [Pa].
+    vickers_c1 : str
+        Key to Vickers correlation coefficient c1 [Pa], if microhardness is
+        not supplied.
+    vickers_c2 : str
+        Key to Vickers correlation coefficient c2 [-], if microhardness is
+        not supplied.
+    gas_pressure : str
+        Key to gas pressure Pg [Pa].
+    gas_temperature : str
+        Key to gas temperature Tg [K].
+    accommodation_coefficient : str
+        Key to thermal accommodation coefficient alpha_T [-].
+    gas_specific_heat_ratio : str
+        Key to gas specific heat ratio gamma_g [-].
+    gas_prandtl : str
+        Key to gas Prandtl number Pr [-].
+    gas_mean_free_path_ref : str
+        Key to reference mean free path Lambda_0 [m].
+    reference_pressure : float
+        Reference pressure P0 for the mean-free-path correction [Pa].
+    reference_temperature : float
+        Reference temperature T0 for the mean-free-path correction [K].
+    macro_gap_outer_radius : str or None
+        Optional key for the outer radius of the macrogap integration [m].
+        If None, the smaller connected pore radius is used.
+    integration_points : int
+        Number of points used for radial integration of R_G.
+
+    Returns
+    -------
+    ndarray
+        Thermal conductance of each throat [W/K].
+    """
+    net = solid_p.network
+    conns = net.conns
+
+    # ---------- helper: inverse complementary error function approximation ----------
+    def _erfcinv_approx(x):
+        """
+        Approximation used in the paper for erfc^{-1}(x).
+        Valid roughly for 1e-9 <= x <= 1.9
+        """
+        x = np.asarray(x, dtype=float)
+        x = np.clip(x, 1e-9, 1.9)
+        out = np.empty_like(x)
+
+        mask1 = (x >= 1e-9) & (x <= 0.02)
+        mask2 = (x > 0.02) & (x <= 0.5)
+        mask3 = (x > 0.5) & (x <= 1.9)
+
+        out[mask1] = 1.0 / (0.218 + 0.735 * x[mask1]**0.173)
+        out[mask2] = 1.05 * (0.175 - x[mask2]) / (x[mask2] - 0.12)
+        out[mask3] = (1.0 - x[mask3]) / (
+            0.707 + 0.862 * x[mask3] - 0.431 * x[mask3]**2
+        )
+        return out
+
+    # ---------- helper: harmonic mean conductivity between connected pores ----------
+    k1 = np.asarray(solid_p[pore_solid_conductivity][conns[:, 0]], dtype=float)
+    k2 = np.asarray(solid_p[pore_solid_conductivity][conns[:, 1]], dtype=float)
+    k_s = np.zeros_like(k1, dtype=float)
+    valid_k = (k1 > 0.0) & (k2 > 0.0)
+    k_s[valid_k] = 2.0 * k1[valid_k] * k2[valid_k] / (k1[valid_k] + k2[valid_k])
+
+    # ---------- required throat / network data ----------
+    k_g = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
+    q_eff = np.asarray(net[effective_radius], dtype=float)              # effective radius of curvature
+    F = np.asarray(net[normal_force], dtype=float)
+    Eeff = np.asarray(net[effective_elastic_modulus], dtype=float)
+    sigma = np.asarray(net[roughness], dtype=float)
+    slope = np.asarray(net[asperity_slope], dtype=float)
+
+    r1 = np.asarray(net[diameter][conns[:, 0]], dtype=float) / 2.0
+    r2 = np.asarray(net[diameter][conns[:, 1]], dtype=float) / 2.0
+    q_local = np.minimum(r1, r2)  # geometric throat-scale closure for outer gap size
+
+    # ---------- microhardness ----------
+    if microhardness in net.keys():
+        Hmic = np.asarray(net[microhardness], dtype=float)
+        H0 = Hmic.copy()
+    elif microhardness in solid_p.keys():
+        Hmic = np.asarray(solid_p[microhardness], dtype=float)
+        H0 = Hmic.copy()
+    else:
+        if vickers_c1 not in net.keys() or vickers_c2 not in net.keys():
+            raise KeyError(
+                "Provide either 'throat.microhardness' or both "
+                "'throat.vickers_c1' and 'throat.vickers_c2'."
+            )
+        c1 = np.asarray(net[vickers_c1], dtype=float)
+        c2 = np.asarray(net[vickers_c2], dtype=float)
+        # paper uses r0' = sigma / (1 micron)
+        sigma_um = sigma / 1e-6
+        ratio = np.maximum(sigma_um / np.maximum(slope, 1e-30), 1e-30)
+        Hmic = c1 * ratio**c2
+        H0 = c1 * np.maximum(1.62 * sigma_um / np.maximum(slope, 1e-30), 1e-30)**c2
+
+    # ---------- gas rarefaction parameter ----------
+    Pg = np.asarray(net[gas_pressure], dtype=float)
+    Tg = np.asarray(net[gas_temperature], dtype=float)
+    alpha = np.asarray(net[accommodation_coefficient], dtype=float)
+    gamma_g = np.asarray(net[gas_specific_heat_ratio], dtype=float)
+    Pr = np.asarray(net[gas_prandtl], dtype=float)
+    Lambda0 = np.asarray(net[gas_mean_free_path_ref], dtype=float)
+
+    # mean free path, paper Eq. (9)
+    Lambda = (reference_pressure / np.maximum(Pg, 1e-30)) * (Tg / reference_temperature) * Lambda0
+
+    # gas parameter M, assuming same accommodation coefficient on both sides
+    # M = [ (2-alpha)/alpha + (2-alpha)/alpha ] * [2*gamma/(gamma+1)] * (1/Pr) * Lambda
+    M = 2.0 * ((2.0 - alpha) / np.maximum(alpha, 1e-30)) \
+        * (2.0 * gamma_g / (gamma_g + 1.0)) \
+        * (1.0 / np.maximum(Pr, 1e-30)) \
+        * Lambda
+
+    # ---------- contact mechanics ----------
+    # Smooth-sphere Hertz radius
+    a_H = np.zeros_like(F, dtype=float)
+    valid_hertz = (F > 0.0) & (q_eff > 0.0) & (Eeff > 0.0)
+    a_H[valid_hertz] = (0.75 * F[valid_hertz] * q_eff[valid_hertz] / Eeff[valid_hertz])**(1.0 / 3.0)
+
+    P0_H = np.zeros_like(F, dtype=float)
+    mask_PH = valid_hertz & (a_H > 0.0)
+    P0_H[mask_PH] = 1.5 * F[mask_PH] / (np.pi * a_H[mask_PH]**2)
+
+    # paper Eq. (7)
+    alpha_cm = np.zeros_like(F, dtype=float)
+    j = np.zeros_like(F, dtype=float)
+    mask_cm = valid_hertz & (a_H > 0.0) & (Hmic > 0.0) & (sigma >= 0.0)
+    alpha_cm[mask_cm] = sigma[mask_cm] * q_eff[mask_cm] / np.maximum(a_H[mask_cm]**2, 1e-30)
+    j[mask_cm] = (Eeff[mask_cm] / np.maximum(Hmic[mask_cm], 1e-30)) \
+                 * np.sqrt(np.maximum(sigma[mask_cm], 0.0) / np.maximum(q_eff[mask_cm], 1e-30))
+
+    # paper Eq. (5)
+    P0_ratio = np.ones_like(F, dtype=float)
+    mask_ratio = mask_cm & (j > 0.0)
+    P0_ratio[mask_ratio] = 1.0 / (1.0 + 1.22 * alpha_cm[mask_ratio] * j[mask_ratio]**(-0.16))
+    P0_ratio = np.clip(P0_ratio, 0.01, 1.0)
+
+    # paper Eq. (6)
+    aL_over_aH = np.ones_like(F, dtype=float)
+    mask_low = P0_ratio <= 0.47
+    mask_high = P0_ratio > 0.47
+    aL_over_aH[mask_low] = 1.605 / np.sqrt(P0_ratio[mask_low])
+    aL_over_aH[mask_high] = 3.51 - 2.51 * P0_ratio[mask_high]
+
+    a_L = aL_over_aH * a_H
+    P0 = P0_ratio * P0_H
+
+    # ---------- resistances ----------
+    # (1) microcontact solid resistance, paper Eq. (2)
+    R_s = np.full_like(F, np.inf, dtype=float)
+    mask_Rs = (k_s > 0.0) & (F > 0.0) & (slope > 0.0)
+
+    # Smooth-surface limit: sigma -> 0 => Rs -> 0
+    smooth = mask_Rs & (sigma <= 0.0)
+    R_s[smooth] = 0.0
+
+    rough = mask_Rs & (sigma > 0.0)
+    R_s[rough] = 0.565 * Hmic[rough] * (sigma[rough] / slope[rough]) / (
+        np.maximum(k_s[rough], 1e-30) * F[rough]
+    )
+
+    # (2) macrocontact spreading resistance, paper Eq. (8)
+    R_L = np.full_like(F, np.inf, dtype=float)
+    mask_RL = (k_s > 0.0) & (a_L > 0.0)
+    R_L[mask_RL] = 1.0 / (2.0 * k_s[mask_RL] * a_L[mask_RL])
+
+    # (3) microgap gas resistance, paper Eq. (13)
+    R_g = np.full_like(F, np.inf, dtype=float)
+
+    # smooth limit from paper Eq. (21)
+    mask_Rg_smooth = (sigma <= 0.0) & (k_g > 0.0) & (a_H > 0.0)
+    R_g[mask_Rg_smooth] = M[mask_Rg_smooth] / (
+        np.pi * k_g[mask_Rg_smooth] * a_H[mask_Rg_smooth]**2
+    )
+
+    # rough case
+    mask_Rg = (sigma > 0.0) & (k_g > 0.0) & (a_L > 0.0) & (H0 > 0.0) & (P0 > 0.0)
+    if np.any(mask_Rg):
+        x1 = np.clip(2.0 * P0[mask_Rg] / H0[mask_Rg], 1e-9, 1.9)
+        x2 = np.clip(0.03 * P0[mask_Rg] / H0[mask_Rg], 1e-9, 1.9)
+
+        a1 = _erfcinv_approx(x1)
+        a2 = _erfcinv_approx(x2) - a1
+
+        denom = a1 + M[mask_Rg] / np.maximum(2.0 * np.sqrt(2.0) * sigma[mask_Rg], 1e-30)
+        logterm = np.log(1.0 + a2 / np.maximum(denom, 1e-30))
+
+        R_g[mask_Rg] = (
+            2.0 * np.sqrt(2.0) * sigma[mask_Rg]
+            / (np.pi * k_g[mask_Rg] * a_L[mask_Rg]**2)
+        ) * logterm
+
+    # (4) macrogap gas resistance, paper Eq. (14)
+    # We evaluate the same macrogap contribution numerically:
+    # G_G = ∫[a_L -> b_L] 2*pi*k_g*r / (gap(r) + M) dr
+    # with gap(r) = 2*(q - x0) - 2*sqrt(q^2 - r^2)
+    # and R_G = 1 / G_G
+    R_G = np.full_like(F, np.inf, dtype=float)
+
+    if macro_gap_outer_radius is None:
+        b_L = q_local.copy()
+    else:
+        b_L = np.asarray(net[macro_gap_outer_radius], dtype=float)
+
+    x0 = np.zeros_like(F, dtype=float)
+    mask_x0 = q_local > 0.0
+    x0[mask_x0] = a_L[mask_x0]**2 / (2.0 * q_local[mask_x0])
+
+    for i in range(net.Nt):
+        if not (
+            np.isfinite(a_L[i])
+            and np.isfinite(b_L[i])
+            and np.isfinite(q_local[i])
+            and np.isfinite(k_g[i])
+            and np.isfinite(M[i])
+            and (k_g[i] > 0.0)
+            and (q_local[i] > 0.0)
+            and (b_L[i] > a_L[i])
+        ):
+            continue
+
+        r = np.linspace(a_L[i], b_L[i], integration_points)
+        root = np.sqrt(np.maximum(q_local[i]**2 - r**2, 0.0))
+        gap = 2.0 * (q_local[i] - x0[i]) - 2.0 * root
+        denom = np.maximum(gap + M[i], 1e-30)
+
+        integrand = 2.0 * np.pi * k_g[i] * r / denom
+        Gg = np.trapz(integrand, r)
+
+        if Gg > 0.0:
+            R_G[i] = 1.0 / Gg
+
+    # ---------- combine resistances ----------
+    # Rs || Rg
+    R_parallel_micro = np.full_like(F, np.inf, dtype=float)
+    inv_micro = np.zeros_like(F, dtype=float)
+
+    mask_rs = np.isfinite(R_s) & (R_s > 0.0)
+    inv_micro[mask_rs] += 1.0 / R_s[mask_rs]
+
+    # If Rs == 0, the parallel branch is zero resistance
+    mask_rs_zero = (R_s == 0.0)
+    R_parallel_micro[mask_rs_zero] = 0.0
+
+    mask_rg = np.isfinite(R_g) & (R_g > 0.0)
+    inv_micro[mask_rg] += 1.0 / R_g[mask_rg]
+
+    mask_micro = (R_parallel_micro != 0.0) & (inv_micro > 0.0)
+    R_parallel_micro[mask_micro] = 1.0 / inv_micro[mask_micro]
+
+    # series branch: R_L + (R_s || R_g)
+    R_series = np.full_like(F, np.inf, dtype=float)
+    finite_series = np.isfinite(R_L) & np.isfinite(R_parallel_micro)
+    R_series[finite_series] = R_L[finite_series] + R_parallel_micro[finite_series]
+
+    # total: [1/R_series + 1/R_G]^{-1}
+    conductance = np.zeros_like(F, dtype=float)
+    inv_total = np.zeros_like(F, dtype=float)
+
+    mask_series = np.isfinite(R_series) & (R_series > 0.0)
+    inv_total[mask_series] += 1.0 / R_series[mask_series]
+
+    mask_RG = np.isfinite(R_G) & (R_G > 0.0)
+    inv_total[mask_RG] += 1.0 / R_G[mask_RG]
+
+    valid_total = inv_total > 0.0
+    conductance[valid_total] = 1.0 / (1.0 / inv_total[valid_total])
+
+    # Clean up tiny numerical noise
+    conductance = np.maximum(conductance, 0.0)
+    return conductance

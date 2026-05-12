@@ -476,7 +476,32 @@ class TestThermalConductanceGoldenMaster:
                     effective_radius="throat.effective_radius",
                 ),
             },
+            "bahrami_rough_joint": {
+                "model": tc.bahrami_rough_joint,
+                "kwargs": self._alias_kwargs(
+                    "bahrami_rough_joint",
+                    pore_solid_conductivity="pore.thermal_conductivity",
+                    throat_fluid_conductivity="throat.thermal_fluid_conductivity",
+                    effective_radius="throat.effective_radius",
+                    diameter="pore.diameter",
+                    normal_force="throat.normal_force",
+                    effective_elastic_modulus="throat.effective_elastic_modulus",
+                    roughness="throat.roughness",
+                    asperity_slope="throat.asperity_slope",
+                    microhardness="throat.microhardness",
+                    vickers_c1="throat.vickers_c1",
+                    vickers_c2="throat.vickers_c2",
+                    gas_pressure="throat.gas_pressure",
+                    gas_temperature="throat.gas_temperature",
+                    accommodation_coefficient="throat.accommodation_coefficient",
+                    gas_specific_heat_ratio="throat.gas_specific_heat_ratio",
+                    gas_prandtl="throat.gas_prandtl",
+                    gas_mean_free_path_ref="throat.gas_mean_free_path_ref",
+                ),
+            },
         }
+
+    # TODO: Fully implement bahrami golden test.
 
     # ---Main chapter---
     def _run_model(self, model_name):

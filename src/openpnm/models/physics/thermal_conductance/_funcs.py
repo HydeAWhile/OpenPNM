@@ -611,24 +611,18 @@ def batchelor(
     relative_contact_radius="throat.relative_contact_throat_radius",
     throat_length="throat.length",
     effective_radius_fraction="throat.relative_effective_radius",
+    cutoff_distance_factor="throat.cutoff_distance_factor",
 ):
     r"""
-    Calculates conductance of the bridge model based on Batchelor, O'Brien 1977 model,
-    presented by Yun and Evans (2010). DOI: 10.1016/j.compgeo.2010.06.008
+    Calculates conductance of a Batchelor/O'Brien-style contact-region model
+    arranged in the Yun and Evans (2010) series-network form.
+    DOI: 10.1016/j.compgeo.2010.08.007
 
-    They suggest the fraction of the effective radius of curvature should be 0.5 for dry
-    and 0.8 for wet conditions. Value of 0.25 was used in the more recent article by
-    Fei, Wenbin; Narsilio, Guillermo. DOI: 10.1016/j.jrmge.2021.08.008.
-    They however used it for intra particle conductivity.
-
-    This implementation is fully vectorized and applies the contact / no-contact
-    rule elementwise for each throat.
-
-    The model computes the final conductance as three conductances in series.
-    1. particle-side conductance through pore 1,
-    2. contact / near-contact region conductance,
-    3. particle-side conductance through pore 2
-
+    They suggest the fraction of the effective radius of curvature should be 0.5
+    for dry and 0.8 for wet conditions. This implementation keeps the legacy
+    function name ``batchelor`` for compatibility, but internally follows a
+    simplified throat-level adaptation of the local conductance framework used by
+    Yun and Evans (2010), including overlap contacts and near-contacts.
 
     Parameters
     ----------
@@ -640,7 +634,8 @@ def batchelor(
     throat_fluid_conductivity : str
         %(dict_burb)s throat fluid thermal conductivity
     effective_radius_fraction : str
-        %(dict_burb)s effective radius of curvature fraction
+        %(dict_burb)s effective radius of curvature fraction. Used as the Yun &
+        Evans particle-side geometric factor ``v``.
     effective_radius : str
         %(dict_burb)s mean curvature
         Average curvature of the two particles in the proximity point of their
@@ -648,22 +643,42 @@ def batchelor(
 
         .. math::
 
-            R = \frac{2 * R1 * R2}{R1 + R2}
+            R = \frac{2 * R_1 * R_2}{R_1 + R_2}
 
+        In this implementation, ``effective_radius`` is used as the equivalent
+        radius :math:`R_{ij}` in the local conductance formulas.
     relative_contact_radius : str
-        %(dict_burb)s relative contact throat radius
+        %(dict_burb)s relative contact throat radius. A positive value indicates
+        overlap/contact and is used to define the overlap parameter.
     throat_length : str
-        %(dict_burb)s throat length
+        %(dict_burb)s throat length. In this throat-level adaptation it is used
+        as the separation gap :math:`h_{ij}` for near-contact conduction.
+    cutoff_distance_factor : str
+        %(dict_burb)s cutoff range factor ``e``. Near-contact conduction is
+        included only if :math:`h_{ij} < e R_{ij}`.
 
     Returns
     -------
     ndarray
         Conductance from the sphere to sphere [W/K].
+
+    Notes
+    -----
+    This is a simplified throat-level adaptation of the Yun and Evans (2010)
+    local conductance network model. It preserves the legacy model name and
+    general series structure used in the existing library, while incorporating
+    explicit overlap and near-contact conductance terms. The implementation uses
+    ``throat.length`` as a proxy for particle separation distance and
+    ``effective_radius`` as the equivalent radius.
     """
+    import warnings
+    import numpy as np
+
     net = solid_p.network
     conns = net.conns
     Nt = net.Nt
 
+    # Defaults consistent with source-text calibration for dry systems
     if effective_radius_fraction not in net.keys():
         net[effective_radius_fraction] = 0.5
         warnings.warn(
@@ -671,179 +686,142 @@ def batchelor(
             f"Using default value of 0.5"
         )
 
-    # ---------------------------------------------------------------------
+    if cutoff_distance_factor not in net.keys():
+        net[cutoff_distance_factor] = 0.5
+        warnings.warn(
+            f"No {cutoff_distance_factor} provided in network. "
+            f"Using default value of 0.5"
+        )
+
+    if relative_contact_radius not in net.keys():
+        net[relative_contact_radius] = 0.0
+        warnings.warn(
+            f"No {relative_contact_radius} provided in network. "
+            f"Using default value of 0.0 (no overlap contact)."
+        )
+
+    # ------------------------------------------------------------------
     # Input arrays
-    # ---------------------------------------------------------------------
-    k_s_throat = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
-    k_f = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
+    # ------------------------------------------------------------------
+    ks_throat = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
+    kf = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
 
-    Rm = np.asarray(net[effective_radius], dtype=float)
-    frac = np.asarray(net[effective_radius_fraction], dtype=float)
-    Lt = np.asarray(net[throat_length], dtype=float)
+    # Equivalent radius R_ij
+    Rij = np.asarray(net[effective_radius], dtype=float)
 
-    # Connected pore radii and pore solid conductivities
+    # Yun & Evans geometric factors
+    v = np.asarray(net[effective_radius_fraction], dtype=float)
+    eps = np.asarray(net[cutoff_distance_factor], dtype=float)
+
+    # Throat-level gap distance proxy h_ij
+    hij = np.asarray(net[throat_length], dtype=float)
+
+    # Overlap/contact ratio rc / Rij
+    rel_contact = np.asarray(net[relative_contact_radius], dtype=float)
+
+    # Particle radii and particle-side conductivities
     r1 = np.asarray(net["pore.diameter"][conns[:, 0]], dtype=float) / 2.0
     r2 = np.asarray(net["pore.diameter"][conns[:, 1]], dtype=float) / 2.0
 
     ks1 = np.asarray(solid_p[pore_thermal_conductivity][conns[:, 0]], dtype=float)
     ks2 = np.asarray(solid_p[pore_thermal_conductivity][conns[:, 1]], dtype=float)
 
-    # Effective particle radius scale used for particle-side conductance
-    effective_mean_particle_radius = Rm * frac
+    # Conductivity ratio alpha = k_s / k_f
+    alpha = np.zeros(Nt, dtype=float)
+    valid_alpha = (ks_throat > 0.0) & (kf > 0.0)
+    alpha[valid_alpha] = ks_throat[valid_alpha] / kf[valid_alpha]
 
-    # ---------------------------------------------------------------------
-    # Contact / no-contact logic
-    # ---------------------------------------------------------------------
-    if relative_contact_radius not in net.keys():
-        rel_contact = np.zeros(Nt, dtype=float)
-        mask_no_contact = np.ones(Nt, dtype=bool)
-        mask_contact = np.zeros(Nt, dtype=bool)
-    else:
-        rel_contact = np.asarray(net[relative_contact_radius], dtype=float)
-        mask_no_contact = rel_contact <= 0.0
-        mask_contact = rel_contact > 0.0
+    # ------------------------------------------------------------------
+    # Particle-side conductances C_i^g and C_j^g
+    # C_g^n = pi * k_s * (v * R_ij)^2 / R_n
+    # ------------------------------------------------------------------
+    Rcyl = v * Rij
 
-    # ---------------------------------------------------------------------
-    # Contact-region conductance Cc
-    # ---------------------------------------------------------------------
-    Cc = np.zeros(Nt, dtype=float)
-
-    # Core validity for contact-region formulas
-    valid_core = (
-        (k_s_throat > 0.0)
-        & (k_f > 0.0)
-        & (Rm > 0.0)
-        & (frac > 0.0)
-    )
-
-    conductivity_ratios = np.zeros(Nt, dtype=float)
-    mask_ratio = valid_core & (k_f > 0.0)
-    conductivity_ratios[mask_ratio] = k_s_throat[mask_ratio] / k_f[mask_ratio]
-
-    # -------------------------
-    # No-contact branch
-    # -------------------------
-    # separation_parameter = alpha^2 * Lt / Rm
-    separation_parameters = np.full(Nt, np.nan, dtype=float)
-    mask_sep = valid_core & (Lt > 0.0)
-    separation_parameters[mask_sep] = (
-        conductivity_ratios[mask_sep] ** 2 * Lt[mask_sep] / Rm[mask_sep]
-    )
-
-    mask_no_contact_small = (
-        mask_no_contact
-        & valid_core
-        & (conductivity_ratios > 1.0)   # ensures log(alpha^2) > 0
-        & np.isfinite(separation_parameters)
-        & (separation_parameters < 0.1)
-    )
-
-    if np.any(mask_no_contact_small):
-        tmp = (
-            np.pi
-            * k_f[mask_no_contact_small]
-            * Rm[mask_no_contact_small]
-            * np.log(conductivity_ratios[mask_no_contact_small] ** 2)
-        )
-        Cc[mask_no_contact_small] = np.maximum(tmp, 0.0)
-
-    mask_no_contact_large = (
-        mask_no_contact
-        & valid_core
-        & (Lt > 0.0)
-        & ~mask_no_contact_small
-    )
-
-    if np.any(mask_no_contact_large):
-        arg = (
-            1.0
-            + frac[mask_no_contact_large] ** 2
-            * Rm[mask_no_contact_large]
-            / Lt[mask_no_contact_large]
-        )
-        good = arg > 1.0
-        tmp = np.zeros(np.count_nonzero(mask_no_contact_large), dtype=float)
-        tmp[good] = (
-            np.pi
-            * k_f[mask_no_contact_large][good]
-            * Rm[mask_no_contact_large][good]
-            * np.log(arg[good])
-        )
-        Cc[mask_no_contact_large] = np.maximum(tmp, 0.0)
-
-    # -------------------------
-    # Contact branch
-    # -------------------------
-    beta = conductivity_ratios * rel_contact
-
-    mask_contact_small = (
-        mask_contact
-        & valid_core
-        & (beta > 0.0)
-        & (beta < 1.0)
-        & (conductivity_ratios > 1.0)
-    )
-
-    if np.any(mask_contact_small):
-        tmp = (
-            np.pi
-            * k_f[mask_contact_small]
-            * Rm[mask_contact_small]
-            * (
-                0.17 * beta[mask_contact_small] ** 2
-                + np.log(conductivity_ratios[mask_contact_small] ** 2)
-            )
-        )
-        Cc[mask_contact_small] = np.maximum(tmp, 0.0)
-
-    mask_contact_large = (
-        mask_contact
-        & valid_core
-        & (beta >= 1.0)
-    )
-
-    if np.any(mask_contact_large):
-        tmp = (
-            np.pi
-            * k_f[mask_contact_large]
-            * Rm[mask_contact_large]
-            * (
-                2.0 * beta[mask_contact_large] / np.pi
-                - 2.0 * np.log(beta[mask_contact_large])
-                + np.log(conductivity_ratios[mask_contact_large] ** 2)
-            )
-        )
-        Cc[mask_contact_large] = np.maximum(tmp, 0.0)
-
-    # ---------------------------------------------------------------------
-    # Particle-side conductances
-    # ---------------------------------------------------------------------
     C1p = np.zeros(Nt, dtype=float)
     C2p = np.zeros(Nt, dtype=float)
 
-    mask_p1 = (ks1 > 0.0) & (r1 > 0.0) & (effective_mean_particle_radius > 0.0)
+    mask_p1 = (ks1 > 0.0) & (r1 > 0.0) & (Rcyl > 0.0)
     if np.any(mask_p1):
-        C1p[mask_p1] = (
-            np.pi
-            * ks1[mask_p1]
-            * effective_mean_particle_radius[mask_p1] ** 2
-            / r1[mask_p1]
-        )
+        C1p[mask_p1] = np.pi * ks1[mask_p1] * Rcyl[mask_p1]**2 / r1[mask_p1]
 
-    mask_p2 = (ks2 > 0.0) & (r2 > 0.0) & (effective_mean_particle_radius > 0.0)
+    mask_p2 = (ks2 > 0.0) & (r2 > 0.0) & (Rcyl > 0.0)
     if np.any(mask_p2):
-        C2p[mask_p2] = (
-            np.pi
-            * ks2[mask_p2]
-            * effective_mean_particle_radius[mask_p2] ** 2
-            / r2[mask_p2]
-        )
+        C2p[mask_p2] = np.pi * ks2[mask_p2] * Rcyl[mask_p2]**2 / r2[mask_p2]
 
-    # ---------------------------------------------------------------------
-    # Series combination
-    # 1 / G_total = 1 / C1p + 1 / Cc + 1 / C2p
-    # All three terms must be present for a valid series path.
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Middle contact / near-contact conductance C_contact
+    # ------------------------------------------------------------------
+    Cc = np.zeros(Nt, dtype=float)
+
+    valid_core = (
+        (Rij > 0.0)
+        & (v > 0.0)
+        & (eps > 0.0)
+        & (kf > 0.0)
+        & (alpha > 1.0)
+    )
+
+    # -------------------------
+    # Near-contact / separation gap branch
+    # Included only if 0 < h_ij < eps * R_ij
+    # kappa_ij = alpha^2 * h_ij / R_ij
+    # -------------------------
+    mask_gap = valid_core & (rel_contact <= 0.0) & (hij > 0.0) & (hij < eps * Rij)
+    if np.any(mask_gap):
+        kappa = alpha[mask_gap]**2 * hij[mask_gap] / Rij[mask_gap]
+
+        # Very small-gap asymptote
+        mask_gap_small = kappa <= 1.0
+        if np.any(mask_gap_small):
+            idx = np.where(mask_gap)[0][mask_gap_small]
+            Cc[idx] = (
+                np.pi
+                * kf[idx]
+                * Rij[idx]
+                * np.log(alpha[idx]**2)
+            )
+
+        # General gap branch
+        mask_gap_large = ~mask_gap_small
+        if np.any(mask_gap_large):
+            idx = np.where(mask_gap)[0][mask_gap_large]
+            arg = 1.0 + v[idx]**2 * Rij[idx] / hij[idx]
+            good = arg > 1.0
+            tmp = np.zeros_like(arg)
+            tmp[good] = np.pi * kf[idx][good] * Rij[idx][good] * np.log(arg[good])
+            Cc[idx] = tmp
+
+    # -------------------------
+    # Overlap/contact branch
+    # b_ij = alpha * r_c / R_ij = alpha * rel_contact
+    # -------------------------
+    mask_contact = valid_core & (rel_contact > 0.0)
+    if np.any(mask_contact):
+        idx = np.where(mask_contact)[0]
+        b = alpha[idx] * rel_contact[idx]
+
+        Kc = np.zeros_like(b)
+        dKg = np.zeros_like(b)
+
+        # Small overlap
+        small = b < 1.0
+        if np.any(small):
+            Kc[small] = 0.22 * b[small]**2
+            dKg[small] = -0.05 * b[small]**2
+
+        # Large overlap
+        large = ~small
+        if np.any(large):
+            Kc[large] = 2.0 * b[large] / np.pi
+            dKg[large] = -2.0 * np.log(b[large])
+
+        tmp = np.pi * kf[idx] * Rij[idx] * (Kc + dKg + np.log(alpha[idx]**2))
+        Cc[idx] = np.maximum(tmp, 0.0)
+
+    # ------------------------------------------------------------------
+    # Effective conductance in series:
+    # C_eff = (1/C1p + 1/Cc + 1/C2p)^(-1)
+    # ------------------------------------------------------------------
     conductance = np.zeros(Nt, dtype=float)
 
     valid_series = (C1p > 0.0) & (Cc > 0.0) & (C2p > 0.0)
@@ -1215,7 +1193,7 @@ def fei_narsilio(solid_p,
                  boundary_throats="throat.boundary",
                  diameter="pore.diameter"):
     r"""
-    Calculate thermal conductance using the Fei-Narsilio bridge-contact model.
+    Calculate thermal conductance using the Fei-Narsilio bridge-contact model DOI: 10.1016/j.jrmge.2021.08.008.
 
     This model combines three conductive contributions for each throat:
 

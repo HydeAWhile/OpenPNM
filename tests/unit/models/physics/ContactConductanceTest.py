@@ -204,6 +204,98 @@ def diffusive_size_factors(pn):
 
     return np.vstack([F1, Ft, F2]).T
 
+def throat_normal_force(pn):
+    """
+    Representative steel-ball contact loads per throat: ~20 to 50 N.
+    """
+    c = pn.coords[pn.conns].mean(axis=1)
+    x = c[:, 0] / np.max(pn.coords[:, 0]) if np.max(pn.coords[:, 0]) > 0 else c[:, 0]
+    y = c[:, 1] / np.max(pn.coords[:, 1]) if np.max(pn.coords[:, 1]) > 0 else c[:, 1]
+    z = c[:, 2] / np.max(pn.coords[:, 2]) if np.max(pn.coords[:, 2]) > 0 else c[:, 2]
+    return 20.0 + 10.0 * x + 8.0 * y + 12.0 * z
+
+
+def throat_effective_elastic_modulus(pn):
+    """
+    Effective modulus for identical steel-steel contact using:
+    E = 205 GPa, nu = 0.29
+    E* = 1 / [2 * (1 - nu^2) / E]
+    """
+    E = 205e9
+    nu = 0.29
+    Eeff = 1.0 / (2.0 * (1.0 - nu**2) / E)
+    return np.full(pn.Nt, Eeff, dtype=float)
+
+
+def throat_roughness(pn):
+    """
+    Superfinished steel-bearing rms roughness: ~0.06 to 0.14 um.
+    """
+    c = pn.coords[pn.conns].mean(axis=1)
+    x = c[:, 0] / np.max(pn.coords[:, 0]) if np.max(pn.coords[:, 0]) > 0 else c[:, 0]
+    y = c[:, 1] / np.max(pn.coords[:, 1]) if np.max(pn.coords[:, 1]) > 0 else c[:, 1]
+    z = c[:, 2] / np.max(pn.coords[:, 2]) if np.max(pn.coords[:, 2]) > 0 else c[:, 2]
+    return 0.06e-6 + 0.01e-6 * x + 0.015e-6 * y + 0.02e-6 * z
+
+
+def throat_asperity_slope(pn):
+    """
+    Small mean asperity slope for polished steel surfaces.
+    """
+    c = pn.coords[pn.conns].mean(axis=1)
+    x = c[:, 0] / np.max(pn.coords[:, 0]) if np.max(pn.coords[:, 0]) > 0 else c[:, 0]
+    y = c[:, 1] / np.max(pn.coords[:, 1]) if np.max(pn.coords[:, 1]) > 0 else c[:, 1]
+    z = c[:, 2] / np.max(pn.coords[:, 2]) if np.max(pn.coords[:, 2]) > 0 else c[:, 2]
+    return 0.050 + 0.005 * x + 0.006 * y + 0.008 * z
+
+
+def throat_vickers_c1(pn):
+    return np.full(pn.Nt, 6.8e9, dtype=float)
+
+
+def throat_vickers_c2(pn):
+    return np.full(pn.Nt, -0.12, dtype=float)
+
+
+def throat_microhardness(pn):
+    """
+    Hmic = c1 * (1.62 * sigma_hat / m)^c2
+    with sigma_hat = sigma / 1 um
+    """
+    sigma_hat = pn["throat.roughness"] / 1e-6
+    m = pn["throat.asperity_slope"]
+    c1 = pn["throat.vickers_c1"]
+    c2 = pn["throat.vickers_c2"]
+    return c1 * (1.62 * sigma_hat / m) ** c2
+
+
+def throat_gas_pressure(pn):
+    return np.full(pn.Nt, 101325.0, dtype=float)
+
+
+def throat_gas_temperature(pn):
+    c = pn.coords[pn.conns].mean(axis=1)
+    x = c[:, 0] / np.max(pn.coords[:, 0]) if np.max(pn.coords[:, 0]) > 0 else c[:, 0]
+    y = c[:, 1] / np.max(pn.coords[:, 1]) if np.max(pn.coords[:, 1]) > 0 else c[:, 1]
+    z = c[:, 2] / np.max(pn.coords[:, 2]) if np.max(pn.coords[:, 2]) > 0 else c[:, 2]
+    return 300.0 + 2.0 * x + 3.0 * y + 4.0 * z
+
+
+def throat_accommodation_coefficient(pn):
+    return np.full(pn.Nt, 0.83, dtype=float)
+
+
+def throat_gas_specific_heat_ratio(pn):
+    return np.full(pn.Nt, 1.402, dtype=float)
+
+
+def throat_gas_prandtl(pn):
+    return np.full(pn.Nt, 0.707, dtype=float)
+
+
+def throat_gas_mean_free_path_ref(pn):
+    return np.full(pn.Nt, 67.3e-9, dtype=float)
+
 
 # ---Main chapter---
 class TestThermalConductanceGoldenMaster:
@@ -236,6 +328,20 @@ class TestThermalConductanceGoldenMaster:
         self.solid["throat.thermal_fluid_conductivity"] = throat_thermal_fluid_conductivity(self.net)
         self.solid["throat.thermal_conductivity"] = throat_thermal_conductivity(self.net)
         self.net["throat.diffusive_size_factors"] = diffusive_size_factors(self.net)
+
+        self.net["throat.normal_force"] = throat_normal_force(self.net)
+        self.net["throat.effective_elastic_modulus"] = throat_effective_elastic_modulus(self.net)
+        self.net["throat.roughness"] = throat_roughness(self.net)
+        self.net["throat.asperity_slope"] = throat_asperity_slope(self.net)
+        self.net["throat.vickers_c1"] = throat_vickers_c1(self.net)
+        self.net["throat.vickers_c2"] = throat_vickers_c2(self.net)
+        self.net["throat.microhardness"] = throat_microhardness(self.net)
+        self.net["throat.gas_pressure"] = throat_gas_pressure(self.net)
+        self.net["throat.gas_temperature"] = throat_gas_temperature(self.net)
+        self.net["throat.accommodation_coefficient"] = throat_accommodation_coefficient(self.net)
+        self.net["throat.gas_specific_heat_ratio"] = throat_gas_specific_heat_ratio(self.net)
+        self.net["throat.gas_prandtl"] = throat_gas_prandtl(self.net)
+        self.net["throat.gas_mean_free_path_ref"] = throat_gas_mean_free_path_ref(self.net)
 
         self._validate_fixture()
         self.model_specs = self._build_model_specs()
@@ -501,8 +607,6 @@ class TestThermalConductanceGoldenMaster:
             },
         }
 
-    # TODO: Fully implement bahrami golden test.
-
     # ---Main chapter---
     def _run_model(self, model_name):
         spec = self.model_specs[model_name]
@@ -612,6 +716,9 @@ class TestThermalConductanceGoldenMaster:
 
     def test_tsotsas_zbs(self):
         self.assert_model_matches_baseline("tsotsas_zbs")
+
+    def test_bahrami(self):
+        self.assert_model_matches_baseline("bahrami_rough_joint")
 
 
 # ---Main chapter---

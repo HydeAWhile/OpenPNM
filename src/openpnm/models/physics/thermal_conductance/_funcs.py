@@ -80,60 +80,204 @@ def series_resistors(
                                 size_factors=size_factors)
 
 
-def yovanovich(solid_p,
-               throat_solid_conductivity="throat.thermal_solid_conductivity",
-               relative_contact_radius="throat.relative_contact_throat_radius",
-               effective_radius="throat.effective_radius",
-               relative_gas_conductivity_radius=1e12,
-               radiation_exchange_factor=0
-               ):
+def yovanovich(
+    solid_p,
+    throat_solid_conductivity="throat.thermal_solid_conductivity",
+    throat_fluid_conductivity="throat.thermal_fluid_conductivity",
+    relative_contact_radius="throat.relative_contact_throat_radius",
+    effective_radius="throat.effective_radius",
+    relative_gas_conductivity_radius=2.0,
+    radiation_exchange_factor=0.0,
+    temperature="throat.temperature",
+    include_fluid_conduction=False,
+    include_radiation=False,
+    return_components=False,
+):
     r"""
-    Calculates conductance based on Yovanovich 1967 contact model. DOI: 10.2514/3.28821
-    The model was original developed for thermal conductance thrpugh ball bearings in space.
-    Currently, only conduction is implemented as the remaining resistances proved to be unreliabl. The parameter of
-    relative gas contact radius remains a mystery.
+    Throat conductance based on the Yovanovich (1967) elastic-sphere model.
 
-    Parameters
-    ----------
-    %(solid_p)s
-    pore_thermal_conductivity : str
-        %(dict_burb)s pore thermal conductivity
-    relative_contact_radius : str
-        %(dict_burb)s relative contact radius
-    effective_radius : str
-        %(dict_burb)s effective radius
-        Average radius of the two particles in the proximity point of their contact point. Usually calculated
-        using formula:
+    Implemented branches
+    --------------------
+    1. Solid conduction through the contacting body:
+           R_solid = 1/(2*k_s*a) - ln(2)/(pi*k_s*R)
 
-        .. math::
+    2. Optional fluid conduction through the separation zone
+       (continuum approximation for liquids / dense gases):
+           R_fluid_half = e^2 * R * (eta^2 - 5.1/eta) / (7.1 * k_f)
 
-            R = \frac{2 * R1 * R2}{R1 + R2}
+       where:
+           a   = e * R
+           e   = relative_contact_radius
+           R   = effective_radius
+           eta = outer annulus ratio r/a (must be > 1)
 
-    Returns
-    -------
-    %(return_arr)s
+       The total fluid path is modeled as two identical half-gaps in series:
+           G_fluid = 1 / (2 * R_fluid_half)
 
+    3. Optional radiation branch (linearized):
+           G_rad = A_proj * F_ps * 4 * sigma_SB * T_avg^3
+
+       with:
+           A_proj = pi * R^2
+
+    Total conductance
+    -----------------
+    G_total = G_solid + G_fluid + G_rad
+    where any disabled branch contributes zero.
+
+    Notes
+    -----
+    - This is a throat-level adaptation of the Yovanovich (1967) sphere-plane model.
+    - The solid branch follows the paper's constriction resistance approximation.
+    - The fluid branch here is the continuum approximation, suitable for liquids
+      and dense gases.
+    - Rarefied-gas correction is not included in this version.
     """
-    net = solid_p.network
+    import warnings
+    import numpy as np
 
+    net = solid_p.network
+    Nt = net.Nt
+    sigma_SB = 5.670374419e-8  # Stefan-Boltzmann constant [W/m^2/K^4]
+
+    # --- relative contact radius e = a / R ---
     if relative_contact_radius not in net.keys():
         net[relative_contact_radius] = 0.009
-        warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
+        warnings.warn(
+            f"No {relative_contact_radius} provided in network. "
+            f"Using default value of 0.009"
+        )
 
-    # stef_bolz_const = 5.670374419e-8
-    # radiation_conductance = self.r_particle**2*np.pi*radiation_exchange_factor*4*stef_bolz_const*T_loc
-    # Nelze implementovat, neumime lokalni teplotu
-    # fluid_conductance = 7.1 * fluid_conductivity / (
-    #   relative_contact_radius ** 2 * (relative_gas_conductivity_radius ** 2 - 5.1 / relative_gas_conductivity_radius))
+    e = np.asarray(net[relative_contact_radius], dtype=float)
+    R = np.asarray(net[effective_radius], dtype=float)
 
-    # Calculates the radius of expected contact area
-    contact_radius = net[relative_contact_radius] * net[effective_radius]
+    # Contact radius a = e * R
+    a = e * R
 
-    # calculates the resistance coming from the conduction through solid
-    solid_resistance = 1 / (2 * solid_p[throat_solid_conductivity] * contact_radius) - np.log(2) / (
-            np.pi * solid_p[throat_solid_conductivity] * net[effective_radius])
+    # ---------------------------------------------------------------------
+    # 1) Solid conduction branch
+    # ---------------------------------------------------------------------
+    k_s = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
+    G_solid = np.zeros(Nt, dtype=float)
 
-    return (1 / solid_resistance)
+    valid_s = (k_s > 0.0) & (R > 0.0) & (a > 0.0)
+    if np.any(valid_s):
+        R_solid = (
+            1.0 / (2.0 * k_s[valid_s] * a[valid_s])
+            - np.log(2.0) / (np.pi * k_s[valid_s] * R[valid_s])
+        )
+        good_s = R_solid > 0.0
+        G_solid_valid = np.zeros_like(R_solid)
+        G_solid_valid[good_s] = 1.0 / R_solid[good_s]
+        G_solid[valid_s] = G_solid_valid
+
+    # ---------------------------------------------------------------------
+    # 2) Fluid conduction branch (optional)
+    # ---------------------------------------------------------------------
+    G_fluid = np.zeros(Nt, dtype=float)
+
+    if include_fluid_conduction and (throat_fluid_conductivity in solid_p.keys()):
+        k_f = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
+
+        # eta = outer annulus ratio r/a
+        if isinstance(relative_gas_conductivity_radius, str):
+            if relative_gas_conductivity_radius not in net.keys():
+                net[relative_gas_conductivity_radius] = 2.0
+                warnings.warn(
+                    f"No {relative_gas_conductivity_radius} provided in network. "
+                    f"Using engineering default eta = 2.0"
+                )
+            eta = np.asarray(net[relative_gas_conductivity_radius], dtype=float)
+        else:
+            eta = np.full(Nt, float(relative_gas_conductivity_radius), dtype=float)
+
+        valid_f = (k_f > 0.0) & (R > 0.0) & (e > 0.0) & (eta > 1.0)
+        if np.any(valid_f):
+            shape_term = eta[valid_f]**2 - 5.1 / eta[valid_f]
+            good_shape = shape_term > 0.0
+
+            R_fluid_half = np.zeros_like(shape_term)
+            R_fluid_half[good_shape] = (
+                e[valid_f][good_shape]**2
+                * R[valid_f][good_shape]
+                * shape_term[good_shape]
+                / (7.1 * k_f[valid_f][good_shape])
+            )
+
+            G_fluid_valid = np.zeros_like(shape_term)
+            good_half = R_fluid_half > 0.0
+            G_fluid_valid[good_half] = 1.0 / (2.0 * R_fluid_half[good_half])
+
+            G_fluid[valid_f] = G_fluid_valid
+
+    # ---------------------------------------------------------------------
+    # 3) Radiation branch (optional)
+    # ---------------------------------------------------------------------
+    G_rad = np.zeros(Nt, dtype=float)
+
+    if include_radiation:
+        # Radiation exchange factor F_ps can be scalar, network key, or phase key
+        if isinstance(radiation_exchange_factor, str):
+            if radiation_exchange_factor in net.keys():
+                F_ps = np.asarray(net[radiation_exchange_factor], dtype=float)
+            elif radiation_exchange_factor in solid_p.keys():
+                F_ps = np.asarray(solid_p[radiation_exchange_factor], dtype=float)
+            else:
+                raise KeyError(
+                    f"Radiation exchange factor key '{radiation_exchange_factor}' "
+                    f"not found in network or phase."
+                )
+        else:
+            F_ps = np.full(Nt, float(radiation_exchange_factor), dtype=float)
+
+        # Temperature handling:
+        # 1) explicit key in phase
+        # 2) explicit key in network
+        # 3) average pore.temperature onto throats
+        # 4) scalar
+        if isinstance(temperature, str):
+            if temperature in solid_p.keys():
+                T_avg = np.asarray(solid_p[temperature], dtype=float)
+            elif temperature in net.keys():
+                T_avg = np.asarray(net[temperature], dtype=float)
+            elif (temperature == "throat.temperature") and ("pore.temperature" in solid_p.keys()):
+                T_avg = np.mean(
+                    np.asarray(solid_p["pore.temperature"], dtype=float)[net.conns],
+                    axis=1,
+                )
+            else:
+                raise KeyError(
+                    f"Temperature key '{temperature}' not found in network or phase."
+                )
+        else:
+            T_avg = np.full(Nt, float(temperature), dtype=float)
+
+        A_proj = np.pi * R**2
+        valid_r = (A_proj > 0.0) & (F_ps > 0.0) & (T_avg > 0.0)
+
+        if np.any(valid_r):
+            G_rad[valid_r] = (
+                A_proj[valid_r]
+                * F_ps[valid_r]
+                * 4.0
+                * sigma_SB
+                * T_avg[valid_r]**3
+            )
+
+    # ---------------------------------------------------------------------
+    # Total conductance: parallel branches
+    # ---------------------------------------------------------------------
+    G_total = G_solid + G_fluid + G_rad
+
+    if return_components:
+        return {
+            "total": G_total,
+            "solid": G_solid,
+            "fluid": G_fluid,
+            "radiation": G_rad,
+        }
+    return G_total
+
 
 
 def dixon_bridge_model(
@@ -1284,7 +1428,7 @@ def tsotsas_zbs(solid_p,
 
 def bahrami_rough_joint(
     solid_p,
-    pore_solid_conductivity="pore.thermal_conductivity",
+    pore_solid_conductivity="pore.thermal_solid_conductivity",
     throat_fluid_conductivity="throat.thermal_fluid_conductivity",
     effective_radius="throat.effective_radius",
     diameter="pore.diameter",
@@ -1586,7 +1730,7 @@ def bahrami_rough_joint(
         denom = np.maximum(gap + M[i], 1e-30)
 
         integrand = 2.0 * np.pi * k_g[i] * r / denom
-        Gg = np.trapz(integrand, r)
+        Gg = np.trapezoid(integrand, r)
 
         if Gg > 0.0:
             R_G[i] = 1.0 / Gg

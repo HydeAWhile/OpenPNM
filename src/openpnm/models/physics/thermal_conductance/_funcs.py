@@ -1125,60 +1125,85 @@ def tsotsas_zbs(
     return conductance
 
 
-def argento(solid_p,
-            throat_solid_conductivity="throat.thermal_solid_conductivity",
-            relative_contact_radius="throat.relative_contact_throat_radius",
-            effective_radius="throat.effective_radius",
-            throat_lenght="throat.length"):
+def argento(
+    solid_p,
+    throat_solid_conductivity="throat.thermal_solid_conductivity",
+    relative_contact_radius="throat.relative_contact_throat_radius",
+    effective_radius="throat.effective_radius",
+):
     r"""
-    Calculate thermal conductance using the Argento contact-bridge model.
+    Calculate thermal conductance using the Argento-Bouvard contact model.
+    DOI: 10.1016/0017-9310(95)00257-X
 
-    This model estimates the thermal conductance through a particle bridge based
-    on the throat solid thermal conductivity, the effective particle radius, the
-    relative contact radius, and the total bridge length. The bridge length is
-    defined as the throat length plus one half of each connected particle
-    diameter.
+    This model estimates the thermal conductance through a contact between two
+    deformed spheres based on the finite-element resistance fit reported by
+    Argento and Bouvard (1996). In the original work, the thermal resistance of
+    two touching spheres is expressed as a function of the normalized contact
+    radius, and is used to represent the local resistance to heat flow through a
+    single particle-particle contact.
+
+    In this implementation, that contact-resistance relation is adapted to the
+    throat scale in OpenPNM. The contact radius is obtained from the effective
+    particle radius and the relative contact radius, and the resulting fitted
+    contact resistance is inverted to obtain a throat conductance.
 
     Parameters
     ----------
-    solid_p : OpenPNM phase-like object
-        Phase object containing throat-scale thermal conductivity data and a
-        reference to the associated network.
-    throat_solid_conductivity : str, optional
-        Dictionary key of the throat solid thermal conductivity values [W/m.K].
-    relative_contact_radius : str, optional
-        Dictionary key of the relative contact radius [-]. This quantity scales
-        the conductive bridge area.
-    effective_radius : str, optional
-        Dictionary key of the effective particle radius [m].
-    throat_lenght : str, optional
-        Dictionary key of the throat length [m].
+    %(solid_p)s
+    throat_solid_conductivity : str
+        %(dict_burb)s throat solid thermal conductivity.
+    relative_contact_radius : str
+        %(dict_burb)s relative contact throat radius. This quantity represents the
+        ratio of the contact radius to the effective particle radius.
+    effective_radius : str
+        %(dict_burb)s effective particle radius.
+        Average radius of the two particles in the proximity point of their
+        contact point. Usually calculated using formula:
+
+        .. math::
+
+            R = \frac{2 * R_1 * R_2}{R_1 + R_2}
 
     Returns
     -------
     ndarray
-        Thermal conductance of each throat [W/K].
+        Conductance from sphere to sphere [W/K].
 
-    If ``relative_contact_radius`` is not present in the network, a default
-    value of ``0.009`` is assigned and a warning is issued.
+    Notes
+    -----
+    The original Argento-Bouvard model was developed for conduction through the
+    contact of two deformed spheres and provides a fitted thermal resistance as a
+    function of normalized contact radius. The present implementation is the
+    closest throat-level adaptation of that model: the fitted two-sphere contact
+    resistance is used directly as a throat resistance, and its inverse is
+    returned as the throat conductance.
+
+    If ``relative_contact_radius`` is not present in the network, a default value
+    of ``0.009`` is assigned and a warning is issued.
     """
 
     net = solid_p.network
 
     if relative_contact_radius not in net.keys():
         net[relative_contact_radius] = 0.009
-        warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
+        warnings.warn(
+            f"No {relative_contact_radius} provided in solid phase. "
+            f"Using default value of 0.009"
+        )
 
-    bridge_len = net[throat_lenght] + np.sum((net['pore.diameter'][net.conns] / 2), axis=1)
+    k_s = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
+    R_eff = np.asarray(net[effective_radius], dtype=float)
+    chi = np.asarray(net[relative_contact_radius], dtype=float)
 
-    particle_cross_section = np.pi * np.square(net[effective_radius])
-    resistance = 0.889 / (
-            net[relative_contact_radius] * solid_p[throat_solid_conductivity] * particle_cross_section) * bridge_len
+    rc = chi * R_eff
+    conductance = np.zeros_like(rc, dtype=float)
 
-    conductance = 1 / resistance
+    valid = (k_s > 0.0) & (rc > 0.0)
+    if np.any(valid):
+        resistance = 1.798 / (np.pi * k_s[valid] * rc[valid])
+        conductance[valid] = 1.0 / resistance
 
     return conductance
-
 
 def fei_narsilio(solid_p,
                  pore_thermal_conductivity="pore.thermal_conductivity",

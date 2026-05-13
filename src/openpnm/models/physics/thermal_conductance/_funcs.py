@@ -1511,14 +1511,15 @@ def fei_narsilio(
     return np.maximum(conductance, 0.0)
 
 
-def birkholz(solid_p,
-             relative_contact_radius="throat.relative_contact_throat_radius",
-             effective_radius="throat.effective_radius",
-             pore_thermal_conductivity="pore.thermal_conductivity",
-             ):
-
+def birkholz(
+    solid_p,
+    relative_contact_radius="throat.relative_contact_throat_radius",
+    effective_radius="throat.effective_radius",
+    pore_thermal_conductivity="pore.thermal_conductivity",
+):
     r"""
     Calculate thermal conductance using the Birkholz contact model.
+    DOI: 10.1016/j.powtec.2019.04.005
 
     This model estimates the thermal conductance between two connected particles
     from the effective radius, the relative contact radius, and the thermal
@@ -1551,26 +1552,63 @@ def birkholz(solid_p,
 
     if relative_contact_radius not in net.keys():
         net[relative_contact_radius] = 0.009
-        warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
+        warnings.warn(
+            f"No {relative_contact_radius} provided in solid phase. "
+            f"Using default value of 0.009"
+        )
 
-    solid_conductivities = solid_p[pore_thermal_conductivity][net.conns].T
-    return 4 * net[effective_radius] * net[relative_contact_radius] / (
-            1 / solid_conductivities[0] + 1 / solid_conductivities[1])
+    # Input arrays
+    rel_c = np.asarray(net[relative_contact_radius], dtype=float)
+    R_eff = np.asarray(net[effective_radius], dtype=float)
+
+    # Contact radius r_c = chi * R_eff
+    rc = rel_c * R_eff
+
+    # Pore conductivities on both connected sides
+    k1, k2 = np.asarray(
+        solid_p[pore_thermal_conductivity][net.conns].T,
+        dtype=float,
+    )
+
+    conductance = np.zeros_like(rc, dtype=float)
+
+    # Only positive, physically meaningful values can conduct
+    valid = (
+        (rc > 0.0)
+        & (R_eff > 0.0)
+        & (k1 > 0.0)
+        & (k2 > 0.0)
+    )
+
+    if np.any(valid):
+        denom = 1.0 / k1[valid] + 1.0 / k2[valid]
+
+        # Extra guard against pathological zero / inf denominators
+        good = np.isfinite(denom) & (denom > 0.0)
+
+        tmp = np.zeros(np.count_nonzero(valid), dtype=float)
+        tmp[good] = 4.0 * rc[valid][good] / denom[good]
+
+        conductance[valid] = tmp
+
+    # Remove tiny negative values from numerical noise
+    return np.maximum(conductance, 0.0)
 
 
-def zehner_bauer_schlunder(solid_p,
-                           solid_volume="throat.solid_volume",
-                           fluid_volume="throat.fluid_volume",
-                           throat_solid_conductivity="throat.thermal_solid_conductivity",
-                           throat_fluid_conductivity="throat.thermal_fluid_conductivity",
-                           relative_contact_radius="throat.relative_contact_throat_radius",
-                           diameter="pore.diameter",
-                           return_conductance=True
-                           ):
-
+def zehner_bauer_schlunder(
+    solid_p,
+    solid_volume="throat.solid_volume",
+    fluid_volume="throat.fluid_volume",
+    throat_solid_conductivity="throat.thermal_solid_conductivity",
+    throat_fluid_conductivity="throat.thermal_fluid_conductivity",
+    relative_contact_radius="throat.relative_contact_throat_radius",
+    diameter="pore.diameter",
+    return_conductance=True,
+):
     r"""
     Calculate effective throat conductivity or conductance using the
     Zehner-Bauer-Schlünder (ZBS) model.
+    DOI: 10.1016/j.ijheatmasstransfer.2018.12.090
 
     This model estimates the effective thermal transport through a two-phase
     throat region composed of solid and fluid, based on the local porosity,
@@ -1612,70 +1650,131 @@ def zehner_bauer_schlunder(solid_p,
     tuple of ndarray
         Effective throat conductivity [W/m.K] and porosity [-], if
         ``return_conductance=False``.
-
-    Notes
-    -----
-    If ``solid_volume`` is not available, it is estimated as the sum of two
-    hemispherical particle volumes:
-
-    .. math::
-
-        V_s = \frac{2}{3}\pi r_1^3 + \frac{2}{3}\pi r_2^3
-
-    If ``fluid_volume`` is not available, the total unit-cell volume is
-    estimated from the larger connected particle diameter and the throat length
-    :math:`(r_1 + r_2)`, and the fluid volume is obtained by subtraction.
-
-    If ``return_conductance=True``, the throat conductance is obtained from the
-    effective throat conductivity, the cross-sectional area of the unit cell,
-    and the throat length.
-
-    If ``relative_contact_radius`` is not present in the network, a default
-    value of ``0.009`` is assigned and a warning is issued.
     """
 
     net = solid_p.network
-    r1, r2 = (net[diameter][net.conns] / 2).T
+    conns = net.conns
 
+    r1, r2 = (np.asarray(net[diameter], dtype=float)[conns] / 2.0).T
+
+    # ------------------------------------------------------------------
+    # Volumes
+    # ------------------------------------------------------------------
     if solid_volume not in net.keys():
-        net[solid_volume] = 2 / 3 * np.pi * r1 ** 3 + 2 / 3 * np.pi * r2 ** 3
-        warnings.warn(f"No {solid_volume} volume provided in the network. Calculated from praticle diameter.")
+        net[solid_volume] = 2.0 / 3.0 * np.pi * r1**3 + 2.0 / 3.0 * np.pi * r2**3
+        warnings.warn(
+            f"No {solid_volume} volume provided in the network. "
+            f"Calculated from particle diameter."
+        )
 
     if fluid_volume not in net.keys():
-        total_volume = (np.maximum(r1, r2) * 2) ** 2 * (r1 + r2)
+        total_volume = (np.maximum(r1, r2) * 2.0) ** 2 * (r1 + r2)
         net[fluid_volume] = total_volume - net[solid_volume]
         warnings.warn(
-            f"No {fluid_volume} provided in the network. Calculated from total volume assuming unit cell of the larger particle diameter.")
+            f"No {fluid_volume} provided in the network. "
+            f"Calculated from total volume assuming unit cell of the larger particle diameter."
+        )
     else:
-        total_volume = net[solid_volume] + net[fluid_volume]
+        total_volume = np.asarray(net[solid_volume], dtype=float) + np.asarray(net[fluid_volume], dtype=float)
 
     if relative_contact_radius not in net.keys():
         net[relative_contact_radius] = 0.009
-        warnings.warn(f"No {relative_contact_radius} provided in solid phase. Using default value of 0.009")
+        warnings.warn(
+            f"No {relative_contact_radius} provided in solid phase. "
+            f"Using default value of 0.009"
+        )
 
-    flattening_coef = net[relative_contact_radius] ** 2
-    porosity = net[fluid_volume] / total_volume
+    Vs = np.asarray(net[solid_volume], dtype=float)
+    Vf = np.asarray(net[fluid_volume], dtype=float)
+    total_volume = Vs + Vf
 
-    rel_solid_conductivity = solid_p[throat_solid_conductivity] / solid_p[throat_fluid_conductivity]
+    # ------------------------------------------------------------------
+    # Basic quantities
+    # ------------------------------------------------------------------
+    flattening_coef = np.asarray(net[relative_contact_radius], dtype=float) ** 2
+    porosity = np.zeros_like(total_volume, dtype=float)
 
-    b = 1.25 * ((1 - porosity) / porosity) ** (10 / 9)
-    n = 1 - b / rel_solid_conductivity
+    valid_vol = total_volume > 0.0
+    porosity[valid_vol] = Vf[valid_vol] / total_volume[valid_vol]
 
-    rel_unit_cell_cunductivity = 2 / n * (b / n ** 2 * (rel_solid_conductivity - 1) /
-                                          rel_solid_conductivity * np.log(rel_solid_conductivity / b) - (b + 1) / 2 - (
-                                                  b - 1) / n)
-    rel_throat_conductivity = ((1 - np.sqrt(1 - porosity)) + np.sqrt(1 - porosity) *
-                               (flattening_coef * rel_solid_conductivity + (
-                                       1 - flattening_coef) * rel_unit_cell_cunductivity))
+    ks = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
+    kf = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
+
+    rel_solid_conductivity = np.zeros_like(ks, dtype=float)
+    valid_k = (ks > 0.0) & (kf > 0.0)
+    rel_solid_conductivity[valid_k] = ks[valid_k] / kf[valid_k]
+
+    rel_unit_cell_conductivity = np.zeros_like(ks, dtype=float)
+    rel_throat_conductivity = np.zeros_like(ks, dtype=float)
+
+    # ------------------------------------------------------------------
+    # ZBS model with guards
+    # ------------------------------------------------------------------
+    valid = (
+        valid_vol
+        & (porosity > 0.0)
+        & (porosity < 1.0)
+        & valid_k
+        & (flattening_coef >= 0.0)
+    )
+
+    if np.any(valid):
+        b = np.zeros_like(ks, dtype=float)
+        b[valid] = 1.25 * ((1.0 - porosity[valid]) / porosity[valid]) ** (10.0 / 9.0)
+
+        n = np.zeros_like(ks, dtype=float)
+        n[valid] = 1.0 - b[valid] / rel_solid_conductivity[valid]
+
+        # Need positive log argument and nonzero n
+        valid_zbs = (
+            valid
+            & (b > 0.0)
+            & (rel_solid_conductivity > 0.0)
+            & (rel_solid_conductivity / b > 0.0)
+            & (~np.isclose(n, 0.0))
+        )
+
+        if np.any(valid_zbs):
+            bz = b[valid_zbs]
+            nz = n[valid_zbs]
+            kz = rel_solid_conductivity[valid_zbs]
+
+            rel_unit_cell_conductivity[valid_zbs] = (
+                2.0 / nz
+                * (
+                    bz / nz**2 * (kz - 1.0) / kz * np.log(kz / bz)
+                    - (bz + 1.0) / 2.0
+                    - (bz - 1.0) / nz
+                )
+            )
+
+            rel_throat_conductivity[valid_zbs] = (
+                (1.0 - np.sqrt(1.0 - porosity[valid_zbs]))
+                + np.sqrt(1.0 - porosity[valid_zbs])
+                * (
+                    flattening_coef[valid_zbs] * rel_solid_conductivity[valid_zbs]
+                    + (1.0 - flattening_coef[valid_zbs]) * rel_unit_cell_conductivity[valid_zbs]
+                )
+            )
+
+    # Convert from relative conductivity to absolute conductivity
+    throat_conductivity = rel_throat_conductivity * kf
 
     if return_conductance:
-        cross_section = (np.maximum(r1, r2) * 2) ** 2
-        length_throat = (r1 + r2)
+        cross_section = (np.maximum(r1, r2) * 2.0) ** 2
+        length_throat = r1 + r2
 
-        conductance = rel_throat_conductivity * solid_p[throat_fluid_conductivity] * cross_section / length_throat
+        conductance = np.zeros_like(throat_conductivity, dtype=float)
+        valid_g = (throat_conductivity > 0.0) & (cross_section > 0.0) & (length_throat > 0.0)
+        if np.any(valid_g):
+            conductance[valid_g] = (
+                throat_conductivity[valid_g]
+                * cross_section[valid_g]
+                / length_throat[valid_g]
+            )
         return conductance
     else:
-        return rel_throat_conductivity * solid_p[throat_fluid_conductivity], porosity
+        return throat_conductivity, porosity
 
 
 def bahrami_rough_joint(

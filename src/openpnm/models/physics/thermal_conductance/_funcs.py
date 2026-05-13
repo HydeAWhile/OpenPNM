@@ -89,12 +89,12 @@ def yovanovich(
     effective_radius="throat.effective_radius",
     temperature="throat.temperature",
     radiation_exchange_factor=0.0,
-    include_fluid_conduction=True,
+    include_fluid_conduction=False,
     include_radiation=False,
     eta_min=10.0,
 ):
     r"""
-    Throat conductance model based on Yovanovich (1967), adapted for OpenPNM.
+    Throat conductance model based on Yovanovich (1967) DOI: 10.2514/3.28821, adapted for OpenPNM.
 
     Implemented branches
     --------------------
@@ -301,16 +301,23 @@ def dixon_bridge_model(
     throat_length="throat.length",
 ):
     r"""
-    Calculates conductance based on the Bridge model published by Dixon et al. (2013),
-    using a vectorized analytical solution for the radial integral.
+    Calculate throat conductance using the Dixon et al. (2013) bridge model DOI: 10.1016/j.compchemeng.2012.08.011.
 
     Notes
     -----
-    The original implementation numerically evaluates, for each throat:
+    This implementation uses the analytical closed-form version of the bridge
+    effective conductivity corresponding to Eq. (10) in Dixon et al. when the
+    reduced fluid conductivity k_fr is treated as constant (i.e. the
+    Smoluchowski correction of Eq. (11) is neglected).
 
-        I = ∫_0^{r_bridge} r / (h_f(r) * k_s + h_s(r) * k_f) dr
+    The resulting effective bridge conductivity is then converted into a throat
+    conductance by:
+        G = k_eff * A / L_total
 
-    This version replaces that numerical quadrature with the closed-form solution.
+    where:
+        A       = pi * r_b^2
+        L_total = 2*h_b + throat_length
+        h_b     = R - sqrt(R^2 - r_b^2)
 
     Returns
     -------
@@ -322,70 +329,77 @@ def dixon_bridge_model(
     if relative_bridge_radius not in net.keys():
         net[relative_bridge_radius] = 0.1
         warnings.warn(
-            f"No {relative_bridge_radius} provided in solid phase. "
+            f"No {relative_bridge_radius} provided in network. "
             f"Using default value of 0.1"
         )
 
-    # Particle radius is taken as the smaller of the two connected pores
-    r_particle = np.min(net[diameter][net.conns], axis=1)/2
+    # Particle radius: smaller of the two connected pores
+    r_particle = np.min(np.asarray(net[diameter], dtype=float)[net.conns], axis=1) / 2.0
 
-    # Bridge radius as a fraction of particle radius
-    r_bridge = r_particle * net[relative_bridge_radius]
-
-    # Numerical safety: enforce 0 <= r_bridge <= r_particle
+    # Bridge radius
+    r_bridge = r_particle * np.asarray(net[relative_bridge_radius], dtype=float)
     r_bridge = np.clip(r_bridge, 0.0, r_particle)
 
-    # Length from contact point to symmetry plane
-    # h_f(a) with a = r_bridge
-    # np.max is used to avoid sqrt of negative due to floating point issues when r_bridge is very close to r_particle
+    # Bridge half-thickness h_b
     sqrt_term = np.sqrt(np.maximum(r_particle**2 - r_bridge**2, 0.0))
-    length_bridge = r_particle - sqrt_term
+    h_b = r_particle - sqrt_term
 
     # Conductivities
     k_s = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
     k_f = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
 
-    # Analytical integral from 0 to r_bridge
-    #
-    # I = L / (k_f - k_s)
-    #   + [k_f*L + (k_s - k_f)*R] / (k_f - k_s)^2 * ln(|k_s / k_f|)
-    #
-    # with special case k_f == k_s:
-    # I = r_bridge^2 / (2 * k_f * L)
-    integral_value = np.empty_like(r_bridge, dtype=float)
+    # Initialize output
+    conductance = np.zeros_like(r_bridge, dtype=float)
 
-    equal_k = np.isclose(k_f, k_s)
+    # Only physically meaningful entries
+    valid = (
+        (r_particle > 0.0)
+        & (r_bridge > 0.0)
+        & (h_b > 0.0)
+        & (k_s > 0.0)
+        & (k_f > 0.0)
+    )
+
+    if not np.any(valid):
+        return conductance
+
+    rb = r_bridge[valid]
+    R = r_particle[valid]
+    L = h_b[valid]
+    ks = k_s[valid]
+    kf = k_f[valid]
+
+    # Analytical integral from 0 to r_b
+    integral_value = np.empty_like(rb, dtype=float)
+
+    equal_k = np.isclose(kf, ks, rtol=1e-12, atol=0.0)
     diff_k = ~equal_k
 
     if np.any(diff_k):
-        B = k_f[diff_k] - k_s[diff_k]
-        R = r_particle[diff_k]
-        L = length_bridge[diff_k]
-        A = k_f[diff_k] * L + (k_s[diff_k] - k_f[diff_k]) * R
+        B = kf[diff_k] - ks[diff_k]
+        A = kf[diff_k] * L[diff_k] + (ks[diff_k] - kf[diff_k]) * R[diff_k]
 
         integral_value[diff_k] = (
-            L / B + (A / B**2) * np.log(np.abs(k_s[diff_k] / k_f[diff_k]))
+            L[diff_k] / B
+            + (A / B**2) * np.log(ks[diff_k] / kf[diff_k])
         )
 
     if np.any(equal_k):
-        # When k_f == k_s, denominator becomes constant = k_f * length_bridge
-        # Use the limiting expression directly
-        integral_value[equal_k] = (
-            r_bridge[equal_k] ** 2 / (2.0 * k_f[equal_k] * length_bridge[equal_k])
-        )
+        # Limiting expression for k_f == k_s
+        integral_value[equal_k] = rb[equal_k]**2 / (2.0 * kf[equal_k] * L[equal_k])
 
-    # Total bridge length (full bridge = 2 * half-bridge + throat gap)
-    bridge_length = 2.0 * length_bridge + net[throat_length]
+    # Effective bridge conductivity (constant-k_f version of Dixon Eq. 10)
+    k_eff = 2.0 * L / (rb**2) * integral_value * (ks * kf)
 
-    # Cross-sectional area
-    bridge_crosssection = np.pi * r_bridge**2
+    # Full bridge length used as OpenPNM throat adaptation
+    L_total = 2.0 * L + np.asarray(net[throat_length], dtype=float)[valid]
+    A_bridge = np.pi * rb**2
 
-    # Effective conductivity (same definition as original code)
-    effective_conductivity = 2.0 * length_bridge / (r_bridge**2) * integral_value * (k_s * k_f)
+    good = (k_eff > 0.0) & (L_total > 0.0)
+    G_valid = np.zeros_like(k_eff)
+    G_valid[good] = k_eff[good] * A_bridge[good] / L_total[good]
 
-    # Conductance [W/K]
-    conductance = effective_conductivity * bridge_crosssection / bridge_length
-
+    conductance[valid] = G_valid
     return conductance
 
 
@@ -400,70 +414,39 @@ def extended_dixon_bridge_model(
     r"""
     Calculate thermal conductance of an asymmetric particle bridge.
 
-    This implementation extends the Dixon bridge model to the case where the two
-    connected spheres may have different sizes and different solid
-    conductivities. The bridge is decomposed into three thermal resistances in
-    series:
+    Notes
+    -----
+    This implementation extends the Dixon et al. (2013) bridge model to the case
+    where the two connected particles may have different sizes and different
+    solid conductivities.
 
-    1. conduction through the bridge region on pore 1 side,
-    2. conduction through the fluid gap in the throat,
-    3. conduction through the bridge region on pore 2 side.
+    Each particle-side bridge conductance is computed from the analytical
+    closed-form version of the Dixon bridge conductivity corresponding to Eq. (10)
+    when the reduced fluid conductivity k_fr is treated as constant, i.e. the
+    Smoluchowski correction of Eq. (11) is neglected.
 
-    Parameters
-    ----------
-    solid_p : OpenPNM phase-like object
-        Phase object containing thermal conductivity data and a reference to the
-        associated network.
-    pore_solid_conductivity : str, optional
-        Dictionary key of the pore solid thermal conductivity values [W/m.K].
-    throat_fluid_conductivity : str, optional
-        Dictionary key of the throat fluid thermal conductivity values [W/m.K].
-    relative_bridge_radius : str, optional
-        Dictionary key of the relative bridge radius. The bridge radius is
-        calculated as the specified fraction of the smaller connected particle
-        size.
-    diameter : str, optional
-        Dictionary key of the pore size values used to determine the particle
-        size on each side of the throat.
-    throat_length : str, optional
-        Dictionary key of the throat gap length [m].
+    The total throat conductance is modeled as three resistances in series:
+        1. bridge-side conductance on pore 1 side,
+        2. cylindrical fluid gap conductance through the throat,
+        3. bridge-side conductance on pore 2 side.
 
     Returns
     -------
     ndarray
         Thermal conductance of each throat [W/K].
-
-    Notes
-    -----
-    For each throat, a common bridge radius is defined from the smaller of the
-    two connected particle sizes:
-
-    .. math::
-
-        r_b = \min(R_1, R_2)\,\xi
-
-    where :math:`\xi` is the relative bridge radius.
-
-    For each sphere side, the bridge-side conductance is computed analytically
-    from the corresponding particle size and solid conductivity. The fluid gap
-    is modeled as a cylinder of radius :math:`r_b` and length
-    ``throat_length``. The total conductance is obtained by placing the two
-    bridge-side resistances and the throat-gap resistance in series.
-
-    If ``relative_bridge_radius`` is not present in the network, a default value
-    of ``0.1`` is assigned and a warning is issued.
     """
 
     def _single_sphere_bridge_conductance(r_particle, r_bridge, k_s, k_f):
         """
-        Analytical conductance of one sphere-side bridge segment.
+        Analytical conductance of one sphere-side bridge segment using the
+        constant-k_f closed-form Dixon bridge model.
 
         Parameters
         ----------
         r_particle : ndarray
-            Radius-like particle size for one side of each throat.
+            Particle radius on one side of each throat [m].
         r_bridge : ndarray
-            Common bridge radius for each throat.
+            Common bridge radius for each throat [m].
         k_s : ndarray
             Solid conductivity for the given pore side [W/m.K].
         k_f : ndarray
@@ -479,81 +462,97 @@ def extended_dixon_bridge_model(
         k_s = np.asarray(k_s, dtype=float)
         k_f = np.asarray(k_f, dtype=float)
 
-        # Ensure the bridge radius is physically valid for this sphere
+        # Ensure physically valid local bridge radius
         r_bridge_local = np.clip(r_bridge, 0.0, r_particle)
 
-        # Half-bridge length for this sphere side
+        # Half-bridge thickness h_b for this sphere side
         sqrt_term = np.sqrt(np.maximum(r_particle**2 - r_bridge_local**2, 0.0))
-        length_bridge = r_particle - sqrt_term
+        h_b = r_particle - sqrt_term
 
-        integral_value = np.zeros_like(r_bridge_local, dtype=float)
+        conductance = np.zeros_like(r_bridge_local, dtype=float)
 
         # Only positive, physically meaningful cases can conduct
         valid = (
-            (r_bridge_local > 0.0)
-            & (length_bridge > 0.0)
+            (r_particle > 0.0)
+            & (r_bridge_local > 0.0)
+            & (h_b > 0.0)
             & (k_s > 0.0)
             & (k_f > 0.0)
         )
 
         if not np.any(valid):
-            return integral_value
+            return conductance
 
-        equal_k = valid & np.isclose(k_f, k_s)
-        diff_k = valid & ~np.isclose(k_f, k_s)
+        rb = r_bridge_local[valid]
+        R = r_particle[valid]
+        L = h_b[valid]
+        ks = k_s[valid]
+        kf = k_f[valid]
+
+        # Analytical integral from 0 to r_b
+        integral_value = np.empty_like(rb, dtype=float)
+
+        equal_k = np.isclose(kf, ks, rtol=1e-12, atol=0.0)
+        diff_k = ~equal_k
 
         # Closed form for k_f != k_s
         if np.any(diff_k):
-            R = r_particle[diff_k]
-            L = length_bridge[diff_k]
-            ks = k_s[diff_k]
-            kf = k_f[diff_k]
-
-            A = kf * L + (ks - kf) * R
-            B = kf - ks
+            B = kf[diff_k] - ks[diff_k]
+            A = kf[diff_k] * L[diff_k] + (ks[diff_k] - kf[diff_k]) * R[diff_k]
 
             integral_value[diff_k] = (
-                L / B
-                + (A / B**2) * np.log(ks / kf)
+                L[diff_k] / B
+                + (A / B**2) * np.log(ks[diff_k] / kf[diff_k])
             )
 
         # Limiting expression for k_f == k_s
         if np.any(equal_k):
             integral_value[equal_k] = (
-                r_bridge_local[equal_k] ** 2
-                / (2.0 * k_f[equal_k] * length_bridge[equal_k])
+                rb[equal_k]**2 / (2.0 * kf[equal_k] * L[equal_k])
             )
 
-        # G_side = 2*pi*k_s*k_f*I
-        conductance = 2.0 * np.pi * k_s * k_f * integral_value
+        # Effective conductivity of one bridge-side segment
+        k_eff_side = 2.0 * L / (rb**2) * integral_value * (ks * kf)
 
-        # Remove tiny negative values caused by floating-point noise
-        return np.maximum(conductance, 0.0)
+        # Convert side effective conductivity to side conductance:
+        # G_side = k_eff_side * A / h_b, with A = pi * r_b^2
+        A_bridge = np.pi * rb**2
+        good = (k_eff_side > 0.0) & (L > 0.0)
+
+        G_valid = np.zeros_like(k_eff_side)
+        G_valid[good] = k_eff_side[good] * A_bridge[good] / L[good]
+
+        conductance[valid] = G_valid
+        return conductance
 
     net = solid_p.network
 
     if relative_bridge_radius not in net.keys():
         net[relative_bridge_radius] = 0.1
         warnings.warn(
-            "No relative bridge radius provided in solid phase. "
-            "Using default value of 0.1"
+            f"No {relative_bridge_radius} provided in network. "
+            f"Using default value of 0.1"
         )
 
     conns = net.conns
 
-    # Particle size on each connected side
-    r1 = np.asarray(net[diameter][conns[:, 0]], dtype=float)/2
-    r2 = np.asarray(net[diameter][conns[:, 1]], dtype=float)/2
+    # Particle radius on each connected side
+    r1 = np.asarray(net[diameter][conns[:, 0]], dtype=float) / 2.0
+    r2 = np.asarray(net[diameter][conns[:, 1]], dtype=float) / 2.0
 
-    # Common bridge radius is based on the smaller connected particle
+    # Common bridge radius based on the smaller connected particle
     r_min = np.minimum(r1, r2)
-    r_bridge = np.asarray(r_min * net[relative_bridge_radius], dtype=float)
+    r_bridge = np.asarray(
+        r_min * np.asarray(net[relative_bridge_radius], dtype=float),
+        dtype=float,
+    )
+    r_bridge = np.clip(r_bridge, 0.0, r_min)
 
     # Solid conductivity on each pore side
     ks1 = np.asarray(solid_p[pore_solid_conductivity][conns[:, 0]], dtype=float)
     ks2 = np.asarray(solid_p[pore_solid_conductivity][conns[:, 1]], dtype=float)
 
-    # Throat fluid conductivity and gap length
+    # Throat fluid conductivity and throat gap length
     kf = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
     Lt = np.asarray(net[throat_length], dtype=float)
 
@@ -573,8 +572,7 @@ def extended_dixon_bridge_model(
     )
 
     # Fluid gap conductance through a cylindrical throat region
-    area = np.pi * r_bridge ** 2
-
+    area = np.pi * r_bridge**2
     G_gap = np.zeros_like(r_bridge, dtype=float)
 
     # Positive throat length -> cylindrical fluid conductance
@@ -598,10 +596,10 @@ def extended_dixon_bridge_model(
     total_resistance[mask2] += 1.0 / G2[mask2]
 
     conductance = np.zeros_like(r_bridge, dtype=float)
-    valid = total_resistance > 0.0
-    conductance[valid] = 1.0 / total_resistance[valid]
+    valid_total = total_resistance > 0.0
+    conductance[valid_total] = 1.0 / total_resistance[valid_total]
 
-    return conductance
+    return np.maximum(conductance, 0.0)
 
 
 def batchelor(solid_p,

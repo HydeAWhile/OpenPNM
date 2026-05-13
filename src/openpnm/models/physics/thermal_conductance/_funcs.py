@@ -85,31 +85,36 @@ def yovanovich(
     throat_solid_conductivity="throat.thermal_solid_conductivity",
     throat_fluid_conductivity="throat.thermal_fluid_conductivity",
     relative_contact_radius="throat.relative_contact_throat_radius",
+    relative_bridge_radius="throat.relative_bridge_radius",
     effective_radius="throat.effective_radius",
-    relative_gas_conductivity_radius=2.0,
-    radiation_exchange_factor=0.0,
     temperature="throat.temperature",
-    include_fluid_conduction=False,
+    radiation_exchange_factor=0.0,
+    include_fluid_conduction=True,
     include_radiation=False,
-    return_components=False,
+    eta_min=10.0,
 ):
     r"""
-    Throat conductance based on the Yovanovich (1967) elastic-sphere model.
+    Throat conductance model based on Yovanovich (1967), adapted for OpenPNM.
 
     Implemented branches
     --------------------
     1. Solid conduction through the contacting body:
            R_solid = 1/(2*k_s*a) - ln(2)/(pi*k_s*R)
 
+       where:
+           a = e * R
+           e = relative_contact_radius
+           R = effective_radius
+
     2. Optional fluid conduction through the separation zone
-       (continuum approximation for liquids / dense gases):
+       using the asymptotic continuum approximation:
+
            R_fluid_half = e^2 * R * (eta^2 - 5.1/eta) / (7.1 * k_f)
 
        where:
-           a   = e * R
-           e   = relative_contact_radius
-           R   = effective_radius
-           eta = outer annulus ratio r/a (must be > 1)
+           eta = r_b / a = xi / e
+           r_b = bridge radius
+           xi  = relative_bridge_radius = r_b / R
 
        The total fluid path is modeled as two identical half-gaps in series:
            G_fluid = 1 / (2 * R_fluid_half)
@@ -122,25 +127,28 @@ def yovanovich(
 
     Total conductance
     -----------------
-    G_total = G_solid + G_fluid + G_rad
-    where any disabled branch contributes zero.
+        G_total = G_solid + G_fluid + G_rad
 
     Notes
     -----
-    - This is a throat-level adaptation of the Yovanovich (1967) sphere-plane model.
+    - This is a throat-level adaptation of the Yovanovich sphere-plane model.
     - The solid branch follows the paper's constriction resistance approximation.
-    - The fluid branch here is the continuum approximation, suitable for liquids
+    - The fluid branch is tied to bridge radius rather than using a free eta parameter. This parameter is still highly
+      influential and does not work well. More tweaking necessary to get good results.
+    - The fluid branch here is the asymptotic continuum approximation for liquids
       and dense gases.
     - Rarefied-gas correction is not included in this version.
+    - eta_min can be used to prevent unrealistically small eta values from making
+      the fluid conductance too large. However the model seems to start working with value over 1000, which seems arbitrary.
     """
-    import warnings
-    import numpy as np
 
     net = solid_p.network
     Nt = net.Nt
     sigma_SB = 5.670374419e-8  # Stefan-Boltzmann constant [W/m^2/K^4]
 
-    # --- relative contact radius e = a / R ---
+    # ---------------------------------------------------------------------
+    # Geometry: contact radius and bridge radius
+    # ---------------------------------------------------------------------
     if relative_contact_radius not in net.keys():
         net[relative_contact_radius] = 0.009
         warnings.warn(
@@ -148,11 +156,28 @@ def yovanovich(
             f"Using default value of 0.009"
         )
 
-    e = np.asarray(net[relative_contact_radius], dtype=float)
+    if relative_bridge_radius not in net.keys():
+        net[relative_bridge_radius] = 0.1
+        warnings.warn(
+            f"No {relative_bridge_radius} provided in network. "
+            f"Using default value of 0.1"
+        )
+
+    e = np.asarray(net[relative_contact_radius], dtype=float)   # e = a / R
+    xi = np.asarray(net[relative_bridge_radius], dtype=float)   # xi = r_b / R
     R = np.asarray(net[effective_radius], dtype=float)
 
-    # Contact radius a = e * R
-    a = e * R
+    contact_radius = e * R
+    bridge_radius = xi * R
+
+    # eta = r_b / a = xi / e
+    eta = np.zeros(Nt, dtype=float)
+    mask_eta = e > 0.0
+    eta[mask_eta] = xi[mask_eta] / e[mask_eta]
+
+    # Optional safeguard against too-small eta values
+    if eta_min is not None:
+        eta = np.maximum(eta, float(eta_min))
 
     # ---------------------------------------------------------------------
     # 1) Solid conduction branch
@@ -160,55 +185,50 @@ def yovanovich(
     k_s = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
     G_solid = np.zeros(Nt, dtype=float)
 
-    valid_s = (k_s > 0.0) & (R > 0.0) & (a > 0.0)
+    valid_s = (k_s > 0.0) & (R > 0.0) & (contact_radius > 0.0)
     if np.any(valid_s):
         R_solid = (
-            1.0 / (2.0 * k_s[valid_s] * a[valid_s])
+            1.0 / (2.0 * k_s[valid_s] * contact_radius[valid_s])
             - np.log(2.0) / (np.pi * k_s[valid_s] * R[valid_s])
         )
+
         good_s = R_solid > 0.0
         G_solid_valid = np.zeros_like(R_solid)
         G_solid_valid[good_s] = 1.0 / R_solid[good_s]
         G_solid[valid_s] = G_solid_valid
 
     # ---------------------------------------------------------------------
-    # 2) Fluid conduction branch (optional)
+    # 2) Fluid conduction branch (optional, asymptotic closed form)
     # ---------------------------------------------------------------------
     G_fluid = np.zeros(Nt, dtype=float)
 
-    if include_fluid_conduction and (throat_fluid_conductivity in solid_p.keys()):
-        k_f = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
+    if include_fluid_conduction:
+        if throat_fluid_conductivity in solid_p.keys():
+            k_f = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
 
-        # eta = outer annulus ratio r/a
-        if isinstance(relative_gas_conductivity_radius, str):
-            if relative_gas_conductivity_radius not in net.keys():
-                net[relative_gas_conductivity_radius] = 2.0
-                warnings.warn(
-                    f"No {relative_gas_conductivity_radius} provided in network. "
-                    f"Using engineering default eta = 2.0"
+            valid_f = (k_f > 0.0) & (R > 0.0) & (e > 0.0) & (eta > 1.0)
+            if np.any(valid_f):
+                shape_term = eta[valid_f]**2 - 5.1 / eta[valid_f]
+                good_shape = shape_term > 0.0
+
+                R_fluid_half = np.zeros_like(shape_term)
+                R_fluid_half[good_shape] = (
+                    e[valid_f][good_shape]**2
+                    * R[valid_f][good_shape]
+                    * shape_term[good_shape]
+                    / (7.1 * k_f[valid_f][good_shape])
                 )
-            eta = np.asarray(net[relative_gas_conductivity_radius], dtype=float)
+
+                good_half = R_fluid_half > 0.0
+                G_fluid_valid = np.zeros_like(R_fluid_half)
+                G_fluid_valid[good_half] = 1.0 / (2.0 * R_fluid_half[good_half])
+
+                G_fluid[valid_f] = G_fluid_valid
         else:
-            eta = np.full(Nt, float(relative_gas_conductivity_radius), dtype=float)
-
-        valid_f = (k_f > 0.0) & (R > 0.0) & (e > 0.0) & (eta > 1.0)
-        if np.any(valid_f):
-            shape_term = eta[valid_f]**2 - 5.1 / eta[valid_f]
-            good_shape = shape_term > 0.0
-
-            R_fluid_half = np.zeros_like(shape_term)
-            R_fluid_half[good_shape] = (
-                e[valid_f][good_shape]**2
-                * R[valid_f][good_shape]
-                * shape_term[good_shape]
-                / (7.1 * k_f[valid_f][good_shape])
+            warnings.warn(
+                f"include_fluid_conduction=True but '{throat_fluid_conductivity}' "
+                f"was not found in phase. Fluid contribution set to zero."
             )
-
-            G_fluid_valid = np.zeros_like(shape_term)
-            good_half = R_fluid_half > 0.0
-            G_fluid_valid[good_half] = 1.0 / (2.0 * R_fluid_half[good_half])
-
-            G_fluid[valid_f] = G_fluid_valid
 
     # ---------------------------------------------------------------------
     # 3) Radiation branch (optional)
@@ -268,14 +288,6 @@ def yovanovich(
     # Total conductance: parallel branches
     # ---------------------------------------------------------------------
     G_total = G_solid + G_fluid + G_rad
-
-    if return_components:
-        return {
-            "total": G_total,
-            "solid": G_solid,
-            "fluid": G_fluid,
-            "radiation": G_rad,
-        }
     return G_total
 
 

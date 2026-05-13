@@ -466,7 +466,6 @@ class TestThermalConductanceGoldenMaster:
                     throat_solid_conductivity="throat.thermal_solid_conductivity",
                     relative_contact_radius="throat.relative_contact_throat_radius",
                     effective_radius="throat.effective_radius",
-                    relative_gas_conductivity_radius=1e12,
                     radiation_exchange_factor=0.0,
                 ),
             },

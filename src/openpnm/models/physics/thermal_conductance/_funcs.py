@@ -602,165 +602,235 @@ def extended_dixon_bridge_model(
     return np.maximum(conductance, 0.0)
 
 
-def batchelor(solid_p,
-              pore_thermal_conductivity="pore.thermal_conductivity",
-              throat_solid_conductivity="throat.thermal_solid_conductivity",
-              throat_fluid_conductivity="throat.thermal_fluid_conductivity",
-              effective_radius="throat.effective_radius",
-              relative_contact_radius="throat.relative_contact_throat_radius",
-              throat_length="throat.length",
-              effective_radius_fraction="throat.relative_effective_radius"
-              ):
+def batchelor(
+    solid_p,
+    pore_thermal_conductivity="pore.thermal_conductivity",
+    throat_solid_conductivity="throat.thermal_solid_conductivity",
+    throat_fluid_conductivity="throat.thermal_fluid_conductivity",
+    effective_radius="throat.effective_radius",
+    relative_contact_radius="throat.relative_contact_throat_radius",
+    throat_length="throat.length",
+    effective_radius_fraction="throat.relative_effective_radius",
+):
     r"""
-    Calculates conductance of the bridge model based on Batchelor, O'Brien 1977 model,
-    presented by Yun and Evans (2010).
+    Calculates conductance of the bridge/contact model based on the
+    Batchelor–O'Brien formulation as used in later particulate-network
+    heat-transfer models.
 
-    They suggest the fraction of the effective radius of curvature should be 0.5 for dry
-    and 0.8 for wet conditions. Value of 0.25 was used in the more recent article by
-    Fei, Wenbin; Narsilio, Guillermo, DOI: 10.1016/j.jrmge.2021.08.008.
-    They however used it for intra particle conductivity.
+    Notes
+    -----
+    This implementation is an OpenPNM throat-level adaptation in which the total
+    conductance is modeled as three resistances in series:
 
-    This implementation is fully vectorized and applies the contact / no-contact
-    rule elementwise for each throat.
+        1. particle-side conductance through pore 1,
+        2. contact / near-contact region conductance,
+        3. particle-side conductance through pore 2.
 
-    Parameters
-    ----------
-    %(solid_p)s
-    pore_thermal_conductivity : str
-        %(dict_burb)s pore thermal conductivity
-    throat_solid_conductivity : str
-        %(dict_burb)s throat thermal conductivity
-    throat_fluid_conductivity : str
-        %(dict_burb)s throat fluid thermal conductivity
-    effective_radius_fraction : str
-        %(dict_burb)s effective radius of curvature fraction
-    effective_radius : str
-        %(dict_burb)s mean curvature
-        Average curvature of the two particles in the proximity point of their
-        contact point. Usually calculated using formula:
-
-        .. math::
-
-            R = \frac{2 * R1 * R2}{R1 + R2}
-
-    relative_contact_radius : str
-        %(dict_burb)s relative contact throat radius
-    throat_length : str
-        %(dict_burb)s throat length
+    The contact-region term is evaluated piecewise for contact / no-contact
+    conditions using the formulas in the current library implementation, while
+    the particle-side terms are computed from an effective radius scale.
 
     Returns
     -------
     ndarray
-        Conductance from the sphere to sphere  [W/K].
+        Conductance from sphere to sphere [W/K].
     """
     net = solid_p.network
+    conns = net.conns
+    Nt = net.Nt
 
     if effective_radius_fraction not in net.keys():
         net[effective_radius_fraction] = 0.5
         warnings.warn(
-            f"No {effective_radius_fraction} provided in solid phase. "
+            f"No {effective_radius_fraction} provided in network. "
             f"Using default value of 0.5"
         )
 
+    # ---------------------------------------------------------------------
     # Input arrays
+    # ---------------------------------------------------------------------
     k_s_throat = np.asarray(solid_p[throat_solid_conductivity], dtype=float)
     k_f = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
-    conductivity_ratios = k_s_throat / k_f  # alpha in text
 
     Rm = np.asarray(net[effective_radius], dtype=float)
     frac = np.asarray(net[effective_radius_fraction], dtype=float)
     Lt = np.asarray(net[throat_length], dtype=float)
 
+    # Connected pore radii and pore solid conductivities
+    r1 = np.asarray(net["pore.diameter"][conns[:, 0]], dtype=float) / 2.0
+    r2 = np.asarray(net["pore.diameter"][conns[:, 1]], dtype=float) / 2.0
+
+    ks1 = np.asarray(solid_p[pore_thermal_conductivity][conns[:, 0]], dtype=float)
+    ks2 = np.asarray(solid_p[pore_thermal_conductivity][conns[:, 1]], dtype=float)
+
+    # Effective particle radius scale used for particle-side conductance
     effective_mean_particle_radius = Rm * frac
 
-    # Elementwise contact / no-contact logic
+    # ---------------------------------------------------------------------
+    # Contact / no-contact logic
+    # ---------------------------------------------------------------------
     if relative_contact_radius not in net.keys():
-        rel_contact = np.zeros_like(conductivity_ratios, dtype=float)
-        mask_no_contact = np.ones_like(conductivity_ratios, dtype=bool)
-        mask_contact = np.zeros_like(conductivity_ratios, dtype=bool)
+        rel_contact = np.zeros(Nt, dtype=float)
+        mask_no_contact = np.ones(Nt, dtype=bool)
+        mask_contact = np.zeros(Nt, dtype=bool)
     else:
         rel_contact = np.asarray(net[relative_contact_radius], dtype=float)
         mask_no_contact = rel_contact <= 0.0
         mask_contact = rel_contact > 0.0
 
-    # Contact-region conductance
-    Cc = np.zeros_like(conductivity_ratios, dtype=float)
+    # ---------------------------------------------------------------------
+    # Contact-region conductance Cc
+    # ---------------------------------------------------------------------
+    Cc = np.zeros(Nt, dtype=float)
 
-    # No-contact branch
-    separation_parameters = conductivity_ratios**2 * Lt / Rm
-
-    mask_no_contact_small = mask_no_contact & (separation_parameters < 0.1)
-    mask_no_contact_large = mask_no_contact & ~mask_no_contact_small
-
-    Cc[mask_no_contact_small] = (
-        np.pi
-        * k_f[mask_no_contact_small]
-        * Rm[mask_no_contact_small]
-        * np.log(conductivity_ratios[mask_no_contact_small] ** 2)
+    # Core validity for contact-region formulas
+    valid_core = (
+        (k_s_throat > 0.0)
+        & (k_f > 0.0)
+        & (Rm > 0.0)
+        & (frac > 0.0)
     )
 
-    Cc[mask_no_contact_large] = (
-        np.pi
-        * k_f[mask_no_contact_large]
-        * Rm[mask_no_contact_large]
-        * np.log(
+    conductivity_ratios = np.zeros(Nt, dtype=float)
+    mask_ratio = valid_core & (k_f > 0.0)
+    conductivity_ratios[mask_ratio] = k_s_throat[mask_ratio] / k_f[mask_ratio]
+
+    # -------------------------
+    # No-contact branch
+    # -------------------------
+    # separation_parameter = alpha^2 * Lt / Rm
+    separation_parameters = np.full(Nt, np.nan, dtype=float)
+    mask_sep = valid_core & (Lt > 0.0)
+    separation_parameters[mask_sep] = (
+        conductivity_ratios[mask_sep] ** 2 * Lt[mask_sep] / Rm[mask_sep]
+    )
+
+    mask_no_contact_small = (
+        mask_no_contact
+        & valid_core
+        & (conductivity_ratios > 1.0)   # ensures log(alpha^2) > 0
+        & np.isfinite(separation_parameters)
+        & (separation_parameters < 0.1)
+    )
+
+    if np.any(mask_no_contact_small):
+        tmp = (
+            np.pi
+            * k_f[mask_no_contact_small]
+            * Rm[mask_no_contact_small]
+            * np.log(conductivity_ratios[mask_no_contact_small] ** 2)
+        )
+        Cc[mask_no_contact_small] = np.maximum(tmp, 0.0)
+
+    mask_no_contact_large = (
+        mask_no_contact
+        & valid_core
+        & (Lt > 0.0)
+        & ~mask_no_contact_small
+    )
+
+    if np.any(mask_no_contact_large):
+        arg = (
             1.0
             + frac[mask_no_contact_large] ** 2
             * Rm[mask_no_contact_large]
             / Lt[mask_no_contact_large]
         )
-    )
+        good = arg > 1.0
+        tmp = np.zeros(np.count_nonzero(mask_no_contact_large), dtype=float)
+        tmp[good] = (
+            np.pi
+            * k_f[mask_no_contact_large][good]
+            * Rm[mask_no_contact_large][good]
+            * np.log(arg[good])
+        )
+        Cc[mask_no_contact_large] = np.maximum(tmp, 0.0)
 
+    # -------------------------
     # Contact branch
+    # -------------------------
     beta = conductivity_ratios * rel_contact
 
-    mask_contact_small = mask_contact & (beta < 1.0)
-    mask_contact_large = mask_contact & ~mask_contact_small
-
-    Cc[mask_contact_small] = (
-        np.pi
-        * k_f[mask_contact_small]
-        * Rm[mask_contact_small]
-        * (
-            0.17 * beta[mask_contact_small] ** 2
-            + np.log(conductivity_ratios[mask_contact_small] ** 2)
-        )
+    mask_contact_small = (
+        mask_contact
+        & valid_core
+        & (beta > 0.0)
+        & (beta < 1.0)
+        & (conductivity_ratios > 1.0)
     )
 
-    Cc[mask_contact_large] = (
-        np.pi
-        * k_f[mask_contact_large]
-        * Rm[mask_contact_large]
-        * (
-            2.0 * beta[mask_contact_large] / np.pi
-            - 2.0 * np.log(beta[mask_contact_large])
-            + np.log(conductivity_ratios[mask_contact_large] ** 2)
+    if np.any(mask_contact_small):
+        tmp = (
+            np.pi
+            * k_f[mask_contact_small]
+            * Rm[mask_contact_small]
+            * (
+                0.17 * beta[mask_contact_small] ** 2
+                + np.log(conductivity_ratios[mask_contact_small] ** 2)
+            )
         )
+        Cc[mask_contact_small] = np.maximum(tmp, 0.0)
+
+    mask_contact_large = (
+        mask_contact
+        & valid_core
+        & (beta >= 1.0)
     )
 
+    if np.any(mask_contact_large):
+        tmp = (
+            np.pi
+            * k_f[mask_contact_large]
+            * Rm[mask_contact_large]
+            * (
+                2.0 * beta[mask_contact_large] / np.pi
+                - 2.0 * np.log(beta[mask_contact_large])
+                + np.log(conductivity_ratios[mask_contact_large] ** 2)
+            )
+        )
+        Cc[mask_contact_large] = np.maximum(tmp, 0.0)
+
+    # ---------------------------------------------------------------------
     # Particle-side conductances
-    r1, r2 = (net["pore.diameter"][net.conns] / 2.0).T
-    solid_conductivities = solid_p[pore_thermal_conductivity][net.conns]
+    # ---------------------------------------------------------------------
+    C1p = np.zeros(Nt, dtype=float)
+    C2p = np.zeros(Nt, dtype=float)
 
-    C1p = np.pi * solid_conductivities[:, 0] * (effective_mean_particle_radius * frac) ** 2 / r1
-    C2p = np.pi * solid_conductivities[:, 1] * (effective_mean_particle_radius * frac) ** 2 / r2
+    mask_p1 = (ks1 > 0.0) & (r1 > 0.0) & (effective_mean_particle_radius > 0.0)
+    if np.any(mask_p1):
+        C1p[mask_p1] = (
+            np.pi
+            * ks1[mask_p1]
+            * effective_mean_particle_radius[mask_p1] ** 2
+            / r1[mask_p1]
+        )
 
+    mask_p2 = (ks2 > 0.0) & (r2 > 0.0) & (effective_mean_particle_radius > 0.0)
+    if np.any(mask_p2):
+        C2p[mask_p2] = (
+            np.pi
+            * ks2[mask_p2]
+            * effective_mean_particle_radius[mask_p2] ** 2
+            / r2[mask_p2]
+        )
+
+    # ---------------------------------------------------------------------
     # Series combination
-    R_total = np.zeros_like(Cc, dtype=float)
+    # 1 / G_total = 1 / C1p + 1 / Cc + 1 / C2p
+    # All three terms must be present for a valid series path.
+    # ---------------------------------------------------------------------
+    conductance = np.zeros(Nt, dtype=float)
 
-    mask1 = C1p > 0.0
-    maskc = Cc > 0.0
-    mask2 = C2p > 0.0
+    valid_series = (C1p > 0.0) & (Cc > 0.0) & (C2p > 0.0)
+    if np.any(valid_series):
+        total_resistance = (
+            1.0 / C1p[valid_series]
+            + 1.0 / Cc[valid_series]
+            + 1.0 / C2p[valid_series]
+        )
+        conductance[valid_series] = 1.0 / total_resistance
 
-    R_total[mask1] += 1.0 / C1p[mask1]
-    R_total[maskc] += 1.0 / Cc[maskc]
-    R_total[mask2] += 1.0 / C2p[mask2]
-
-    conductance = np.zeros_like(Cc, dtype=float)
-    valid = R_total > 0.0
-    conductance[valid] = 1.0 / R_total[valid]
-
-    return conductance
+    return np.maximum(conductance, 0.0)
 
 
 

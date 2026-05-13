@@ -613,27 +613,52 @@ def batchelor(
     effective_radius_fraction="throat.relative_effective_radius",
 ):
     r"""
-    Calculates conductance of the bridge/contact model based on the
-    Batchelor–O'Brien formulation as used in later particulate-network
-    heat-transfer models.
+    Calculates conductance of the bridge model based on Batchelor, O'Brien 1977 model,
+    presented by Yun and Evans (2010). DOI: 10.1016/j.compgeo.2010.06.008
 
-    Notes
-    -----
-    This implementation is an OpenPNM throat-level adaptation in which the total
-    conductance is modeled as three resistances in series:
+    They suggest the fraction of the effective radius of curvature should be 0.5 for dry
+    and 0.8 for wet conditions. Value of 0.25 was used in the more recent article by
+    Fei, Wenbin; Narsilio, Guillermo. DOI: 10.1016/j.jrmge.2021.08.008.
+    They however used it for intra particle conductivity.
 
-        1. particle-side conductance through pore 1,
-        2. contact / near-contact region conductance,
-        3. particle-side conductance through pore 2.
+    This implementation is fully vectorized and applies the contact / no-contact
+    rule elementwise for each throat.
 
-    The contact-region term is evaluated piecewise for contact / no-contact
-    conditions using the formulas in the current library implementation, while
-    the particle-side terms are computed from an effective radius scale.
+    The model computes the final conductance as three conductances in series.
+    1. particle-side conductance through pore 1,
+    2. contact / near-contact region conductance,
+    3. particle-side conductance through pore 2
+
+
+    Parameters
+    ----------
+    %(solid_p)s
+    pore_thermal_conductivity : str
+        %(dict_burb)s pore thermal conductivity
+    throat_solid_conductivity : str
+        %(dict_burb)s throat solid thermal conductivity
+    throat_fluid_conductivity : str
+        %(dict_burb)s throat fluid thermal conductivity
+    effective_radius_fraction : str
+        %(dict_burb)s effective radius of curvature fraction
+    effective_radius : str
+        %(dict_burb)s mean curvature
+        Average curvature of the two particles in the proximity point of their
+        contact point. Usually calculated using formula:
+
+        .. math::
+
+            R = \frac{2 * R1 * R2}{R1 + R2}
+
+    relative_contact_radius : str
+        %(dict_burb)s relative contact throat radius
+    throat_length : str
+        %(dict_burb)s throat length
 
     Returns
     -------
     ndarray
-        Conductance from sphere to sphere [W/K].
+        Conductance from the sphere to sphere [W/K].
     """
     net = solid_p.network
     conns = net.conns
@@ -833,7 +858,6 @@ def batchelor(
     return np.maximum(conductance, 0.0)
 
 
-
 def kunii_smith(
     solid_p,
     throat_solid_conductivity="throat.thermal_solid_conductivity",
@@ -841,7 +865,7 @@ def kunii_smith(
     effective_radius="throat.effective_radius",
 ):
     r"""
-    Calculates conductance of the bridge based on the Kunii and Smith (1960)
+    Calculates conductance of the bridge based on the Kunii and Smith (1960) DOI: 10.1002/aic.690060115
     contact model, adapted here as a throat-level conductance model for OpenPNM.
 
     Notes
@@ -913,7 +937,6 @@ def kunii_smith(
 
     # Small negative values can appear from floating-point noise
     return np.maximum(conductance, 0.0)
-
 
 
 def tsotsas_bob(solid_p,

@@ -17,6 +17,7 @@ __all__ = ["generic_thermal",
            "zehner_bauer_schlunder",
            "tsotsas_zbs",
            "bahrami_rough_joint",
+           "koch_particle_contact_model",
            ]
 
 
@@ -665,8 +666,7 @@ def batchelor(
     Notes
     -----
     This is a simplified throat-level adaptation of the Yun and Evans (2010)
-    local conductance network model. It preserves the legacy model name and
-    general series structure used in the existing library, while incorporating
+    local conductance network model. It incorporates
     explicit overlap and near-contact conductance terms. The implementation uses
     ``throat.length`` as a proxy for particle separation distance and
     ``effective_radius`` as the equivalent radius.
@@ -1191,80 +1191,10 @@ def fei_narsilio(
     relative_contact_radius="throat.relative_contact_throat_radius",
     relative_bridge_radius="throat.relative_bridge_radius",
     effective_radius="throat.effective_radius",
-    boundary_throats="throat.boundary",
+    boundary_pores="pore.boundary",
     diameter="pore.diameter",
     effective_particle_volume_fraction=0.23,
 ):
-    r"""
-    Calculate thermal conductance using the Fei-Narsilio bridge-contact model.
-    DOI: 10.1016/j.jrmge.2021.08.008
-
-    This implementation is a simplified throat-level adaptation inspired by the
-    thermal conductance network model (TCNM) of Fei and Narsilio (2022). It
-    preserves the existing bridge/contact surrogate geometry while using a
-    constant particle-volume fraction coefficient for the particle-side
-    conductance, consistent with the source article.
-
-    The total throat conductance is modeled as three conductances in series:
-
-    1. particle-side conductance through pore 1,
-    2. bridge/contact-region conductance,
-    3. particle-side conductance through pore 2.
-
-    The bridge/contact-region contribution is composed of:
-
-    - a solid contact conductance through the contact area, and
-    - a fluid-gap conductance through the bridge region.
-
-    For internal throats, the fluid-gap conductance is evaluated on both particle
-    sides and combined in series. For boundary throats, only one particle-side gap
-    contribution is used and the second particle-side conductance is evaluated with
-    a unit particle-volume factor for backward compatibility.
-
-    Parameters
-    ----------
-    solid_p : OpenPNM phase-like object
-        Phase object containing pore-scale and throat-scale thermal conductivity
-        data, together with a reference to the associated network.
-    pore_thermal_conductivity : str, optional
-        Dictionary key of the pore thermal conductivity values [W/m.K].
-    throat_solid_conductivity : str, optional
-        Dictionary key of the throat solid thermal conductivity values [W/m.K].
-    throat_fluid_conductivity : str, optional
-        Dictionary key of the throat fluid thermal conductivity values [W/m.K].
-    relative_contact_radius : str, optional
-        Dictionary key of the relative contact radius [-].
-    relative_bridge_radius : str, optional
-        Dictionary key of the relative bridge radius [-].
-    effective_radius : str, optional
-        Dictionary key of the effective throat radius [m].
-    boundary_throats : str, optional
-        Dictionary key of the boolean mask identifying boundary throats.
-    diameter : str, optional
-        Dictionary key of the pore diameter values [m].
-    effective_particle_volume_fraction : float or str, optional
-        Constant coefficient used in the particle-side conductance term,
-        analogous to the coefficient ``c`` in Fei and Narsilio (2022). The
-        default value is 0.23. If a string is given, it is interpreted as a
-        network key providing throat-wise values.
-
-    Returns
-    -------
-    ndarray
-        Thermal conductance of each throat [W/K].
-
-    Notes
-    -----
-    This is a surrogate throat-level adaptation rather than a literal
-    implementation of the image-based TCNM in Fei and Narsilio (2022). The
-    contact and gap conductance terms are represented here using the existing
-    bridge/contact geometry available in the current network model rather than
-    bitmap-derived contact areas and local gap cylinders.
-
-    If ``relative_contact_radius`` is not available, a default value of ``0.009``
-    is used. If ``relative_bridge_radius`` is not available, a default value of
-    ``0.1`` is used.
-    """
     import warnings
     import numpy as np
 
@@ -1286,11 +1216,6 @@ def fei_narsilio(
         return out
 
     def gap_conductance_closed_form(lower_radius, upper_radius, particle_radius, _fluid_conductivity):
-        """
-        Analytical value of:
-            ∫ 2*pi*k_f*r / (R - sqrt(R^2 - r^2)) dr
-        from lower_radius to upper_radius.
-        """
         lower_radius = np.asarray(lower_radius, dtype=float)
         upper_radius = np.asarray(upper_radius, dtype=float)
         particle_radius = np.asarray(particle_radius, dtype=float)
@@ -1317,7 +1242,6 @@ def fei_narsilio(
         ua = np.sqrt(np.maximum(R**2 - a**2, 0.0))
         ub = np.sqrt(np.maximum(R**2 - b**2, 0.0))
 
-        # Safe logarithm ratio
         num = np.maximum(R - ub, 1e-30)
         den = np.maximum(R - ua, 1e-30)
 
@@ -1325,11 +1249,7 @@ def fei_narsilio(
             2.0
             * np.pi
             * kf
-            * (
-                ub
-                - ua
-                + R * np.log(num / den)
-            )
+            * (ub - ua + R * np.log(num / den))
         )
 
         return np.maximum(value, 0.0)
@@ -1356,63 +1276,58 @@ def fei_narsilio(
     Nt = net.Nt
     conns = net.conns
 
-    # ------------------------------------------------------------------
-    # Particle-volume fraction coefficient c:
-    # - float: use a constant value for all throats
-    # - str: treat as a network key
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Particle-volume fraction
+    # ---------------------------------------------------------------
     if isinstance(effective_particle_volume_fraction, str):
         if effective_particle_volume_fraction in net.keys():
             pvf = np.asarray(net[effective_particle_volume_fraction], dtype=float)
         else:
-            raise KeyError(
-                f"Particle-volume fraction key '{effective_particle_volume_fraction}' "
-                f"not found in network."
-            )
+            raise KeyError(f"{effective_particle_volume_fraction} not found")
     else:
         pvf = np.full(Nt, float(effective_particle_volume_fraction), dtype=float)
 
-    # ------------------------------------------------------------------
-    # Relative radii with safe defaults
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Relative radii
+    # ---------------------------------------------------------------
     if relative_contact_radius in net.keys():
         rel_contact = np.asarray(net[relative_contact_radius], dtype=float)
     else:
         rel_contact = np.full(Nt, 0.009, dtype=float)
-        warnings.warn(
-            f"No {relative_contact_radius} provided in solid phase. "
-            f"Using default value of 0.009"
-        )
+        warnings.warn(f"Using default contact radius")
 
     if relative_bridge_radius in net.keys():
         rel_bridge = np.asarray(net[relative_bridge_radius], dtype=float)
     else:
         rel_bridge = np.full(Nt, 0.1, dtype=float)
-        warnings.warn(
-            f"No {relative_bridge_radius} provided in solid phase. "
-            f"Using default value of 0.1"
-        )
+        warnings.warn(f"Using default bridge radius")
 
-    if boundary_throats in net.keys():
-        boundary_mask = np.asarray(net[boundary_throats], dtype=bool)
+    # ---------------------------------------------------------------
+    # PORE-BASED boundary handling
+    # ---------------------------------------------------------------
+    if boundary_pores in net.keys():
+        pore_boundary = np.asarray(net[boundary_pores], dtype=bool)
     else:
-        boundary_mask = np.zeros(Nt, dtype=bool)
-        warnings.warn(
-            f"No {boundary_throats} provided in network. "
-            f"Assuming all throats are internal."
-        )
+        pore_boundary = np.zeros(net.Np, dtype=bool)
+        warnings.warn(f"No {boundary_pores} found, assuming all internal")
 
-    # ------------------------------------------------------------------
-    # Basic geometry and properties
-    # ------------------------------------------------------------------
+    pore1_is_boundary = pore_boundary[conns[:, 0]]
+    pore2_is_boundary = pore_boundary[conns[:, 1]]
+
+    internal_mask = (~pore1_is_boundary) & (~pore2_is_boundary)
+    boundary1_mask = pore1_is_boundary & (~pore2_is_boundary)
+    boundary2_mask = pore2_is_boundary & (~pore1_is_boundary)
+    both_boundary_mask = pore1_is_boundary & pore2_is_boundary  # rare case
+
+    # ---------------------------------------------------------------
+    # Geometry & properties
+    # ---------------------------------------------------------------
     fluid_conductivity = np.asarray(solid_p[throat_fluid_conductivity], dtype=float)
     solid_conductivities = np.asarray(solid_p[pore_thermal_conductivity], dtype=float)[conns]
 
     r1, r2 = (np.asarray(net[diameter], dtype=float)[conns] / 2.0).T
     Reff = np.asarray(net[effective_radius], dtype=float)
 
-    # Surrogate geometry guards:
-    # bridge_radius <= min(r1, r2), contact_radius <= bridge_radius
     r_min = np.minimum(r1, r2)
     bridge_radius = np.minimum(Reff * rel_bridge, r_min)
     contact_radius = np.minimum(Reff * rel_contact, bridge_radius)
@@ -1420,11 +1335,9 @@ def fei_narsilio(
     particle_volume1 = (4.0 / 3.0) * np.pi * r1**3
     particle_volume2 = (4.0 / 3.0) * np.pi * r2**3
 
-    # ------------------------------------------------------------------
-    # Middle solid contact conductance
-    # Preserves original surrogate behavior: contact_length = contact_radius,
-    # roughness coefficient = 0.9
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Contact conductance
+    # ---------------------------------------------------------------
     Cc = contact_conductance(
         _contact_radius=contact_radius,
         _contact_length=contact_radius,
@@ -1432,81 +1345,66 @@ def fei_narsilio(
         _solid_conductivity=np.asarray(solid_p[throat_solid_conductivity], dtype=float),
     )
 
-    # ------------------------------------------------------------------
-    # Middle fluid-gap conductance
-    # ------------------------------------------------------------------
-    Cg1 = gap_conductance_closed_form(
-        lower_radius=contact_radius,
-        upper_radius=bridge_radius,
-        particle_radius=r1,
-        _fluid_conductivity=fluid_conductivity,
-    )
+    # ---------------------------------------------------------------
+    # Gap conductance (both sides)
+    # ---------------------------------------------------------------
+    Cg1 = gap_conductance_closed_form(contact_radius, bridge_radius, r1, fluid_conductivity)
+    Cg2 = gap_conductance_closed_form(contact_radius, bridge_radius, r2, fluid_conductivity)
 
-    Cg2 = gap_conductance_closed_form(
-        lower_radius=contact_radius,
-        upper_radius=bridge_radius,
-        particle_radius=r2,
-        _fluid_conductivity=fluid_conductivity,
-    )
+    Cg = np.zeros_like(r1)
 
-    internal_mask = ~boundary_mask
-    Cg = np.zeros_like(r1, dtype=float)
+    # Internal: series combination
+    valid_internal = internal_mask & (Cg1 > 0) & (Cg2 > 0)
+    Cg[valid_internal] = 1.0 / (1.0 / Cg1[valid_internal] + 1.0 / Cg2[valid_internal])
 
-    # Internal throats: two gap sides in series
-    valid_internal = internal_mask & (Cg1 > 0.0) & (Cg2 > 0.0)
-    if np.any(valid_internal):
-        Cg[valid_internal] = 1.0 / (
-            1.0 / Cg1[valid_internal] + 1.0 / Cg2[valid_internal]
-        )
+    # Boundary on pore 2 (original behavior)
+    Cg[boundary2_mask & (Cg1 > 0)] = Cg1[boundary2_mask & (Cg1 > 0)]
 
-    # Boundary throats: only the first side gap is used
-    valid_boundary = boundary_mask & (Cg1 > 0.0)
-    if np.any(valid_boundary):
-        Cg[valid_boundary] = Cg1[valid_boundary]
+    # Boundary on pore 1 (mirror behavior)
+    Cg[boundary1_mask & (Cg2 > 0)] = Cg2[boundary1_mask & (Cg2 > 0)]
 
-    # ------------------------------------------------------------------
-    # Particle-side conductances using c
-    # ------------------------------------------------------------------
+    # Both boundary → treat like internal (safe fallback)
+    both_valid = both_boundary_mask & (Cg1 > 0) & (Cg2 > 0)
+    Cg[both_valid] = 1.0 / (1.0 / Cg1[both_valid] + 1.0 / Cg2[both_valid])
+
+    # ---------------------------------------------------------------
+    # Particle conductance (side-aware PVF)
+    # ---------------------------------------------------------------
     pvf1 = pvf.copy()
-
-    # Preserve previous special handling of the second side for boundary throats
     pvf2 = pvf.copy()
-    pvf2[boundary_mask] = 1.0
+
+    # Apply boundary logic symmetrically
+    pvf1[boundary1_mask] = 1.0
+    pvf2[boundary2_mask] = 1.0
 
     C1p = particle_conductance(
-        _solid_conductivity=solid_conductivities[:, 0],
-        _particle_volume=particle_volume1,
-        _distance_to_contact=r1,
-        _volume_fraction=pvf1,
+        solid_conductivities[:, 0],
+        particle_volume1,
+        r1,
+        pvf1,
     )
 
     C2p = particle_conductance(
-        _solid_conductivity=solid_conductivities[:, 1],
-        _particle_volume=particle_volume2,
-        _distance_to_contact=r2,
-        _volume_fraction=pvf2,
+        solid_conductivities[:, 1],
+        particle_volume2,
+        r2,
+        pvf2,
     )
 
-    # ------------------------------------------------------------------
-    # Bridge/contact path = fluid gap + solid contact in parallel
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Final combination
+    # ---------------------------------------------------------------
     bridge_path = Cg + Cc
 
-    # ------------------------------------------------------------------
-    # Final strict series combination:
-    # 1 / G = 1 / C1p + 1 / (Cg + Cc) + 1 / C2p
-    # All three segments must be present.
-    # ------------------------------------------------------------------
-    conductance = np.zeros_like(r1, dtype=float)
+    conductance = np.zeros_like(r1)
+    valid_total = (C1p > 0) & (bridge_path > 0) & (C2p > 0)
 
-    valid_total = (C1p > 0.0) & (bridge_path > 0.0) & (C2p > 0.0)
-    if np.any(valid_total):
-        R_total = (
-            1.0 / C1p[valid_total]
-            + 1.0 / bridge_path[valid_total]
-            + 1.0 / C2p[valid_total]
-        )
-        conductance[valid_total] = 1.0 / R_total
+    R_total = (
+        1.0 / C1p[valid_total]
+        + 1.0 / bridge_path[valid_total]
+        + 1.0 / C2p[valid_total]
+    )
+    conductance[valid_total] = 1.0 / R_total
 
     return np.maximum(conductance, 0.0)
 
@@ -1776,6 +1674,142 @@ def zehner_bauer_schlunder(
     else:
         return throat_conductivity, porosity
 
+
+def koch_particle_contact_model(
+    solid_p,
+    pore_solid_conductivity="pore.thermal_conductivity",
+    pore_diameter="pore.diameter",
+    pore_volume="pore.volume",
+    relative_contact_radius="throat.relative_contact_throat_radius",
+    return_resistance=False,
+):
+    r"""
+    Calculate solid-solid thermal conductance between touching particles using
+    a Koch et al. (2021)-style transmissibility model.
+
+    This model follows the dual-network formulation where the grain-grain link
+    is represented by a solid thermal transmissibility t_gamma^s [W/K], which
+    acts as a thermal conductance in the discrete energy balance:
+
+        Q = t_gamma^s * (T_i - T_j)
+
+    The implementation uses the conductive cone / generalized harmonic-mean
+    approximation described in Sect. 5.2 of the paper and applies it to the
+    solid-solid contact between two particles.
+
+    Model assumptions
+    -----------------
+    1. Each throat connects two touching solid particles.
+    2. The contact is circular with radius:
+           r_c = relative_contact_radius * min(R1, R2)
+    3. The center-to-contact distance in each particle is:
+           dx_i = sqrt(R_i^2 - r_c^2)
+    4. The half-particle transmissibility is approximated as:
+           t_i = k_i * sqrt(A_s,i * A_c) / dx_i
+       where:
+           A_c   = pi * r_c^2
+           A_s,i = V_i / (2 * dx_i)
+    5. The full contact conductance is the harmonic mean of the two halves:
+           1 / conductance = 1 / t_1 + 1 / t_2
+
+    Parameters
+    ----------
+    solid_p : OpenPNM phase-like object
+        Phase object with access to the network and pore properties.
+    pore_solid_conductivity : str
+        Key to pore-wise solid thermal conductivity [W/m/K].
+    pore_diameter : str
+        Key to pore diameter [m].
+    pore_volume : str
+        Key to pore volume [m^3]. If not present, sphere volume is used.
+    relative_contact_radius : str
+        Key to throat-wise relative contact radius r_c / min(R1, R2).
+        If absent, a default of 0.1 is used.
+    return_resistance : bool
+        If True, return thermal resistance [K/W] instead of conductance [W/K].
+
+    Returns
+    -------
+    ndarray
+        Thermal conductance [W/K] or resistance [K/W] for each throat.
+    """
+    net = solid_p.network
+
+    # Default contact size if not supplied
+    if relative_contact_radius not in net.keys():
+        net[relative_contact_radius] = 0.1
+        warnings.warn(
+            f"No {relative_contact_radius} provided in network. "
+            f"Using default value of 0.1"
+        )
+
+    conns = net.conns
+
+    # Particle radii for both ends of each throat
+    d = np.asarray(net[pore_diameter], dtype=float)
+    R12 = d[conns] / 2.0
+    R1 = R12[:, 0]
+    R2 = R12[:, 1]
+
+    # Common circular contact radius based on smaller particle
+    rel_rc = np.asarray(net[relative_contact_radius], dtype=float)
+    r_min = np.minimum(R1, R2)
+    r_c = np.clip(rel_rc * r_min, 0.0, r_min)
+
+    # Contact area
+    A_c = np.pi * r_c**2
+
+    # Center-to-contact distances
+    dx1 = np.sqrt(np.maximum(R1**2 - r_c**2, 0.0))
+    dx2 = np.sqrt(np.maximum(R2**2 - r_c**2, 0.0))
+
+    # Pore-wise conductivity
+    k = np.asarray(solid_p[pore_solid_conductivity], dtype=float)
+    k1 = k[conns[:, 0]]
+    k2 = k[conns[:, 1]]
+
+    # Volume: use provided pore volumes if available, otherwise sphere volume
+    if pore_volume in net.keys():
+        V = np.asarray(net[pore_volume], dtype=float)
+    else:
+        V = (4.0 / 3.0) * np.pi * (d / 2.0) ** 3
+
+    V1 = V[conns[:, 0]]
+    V2 = V[conns[:, 1]]
+
+    # Estimate effective solid cross-sectional areas:
+    # A_s ~ V_s / (2 * dx)
+    A_s1 = np.zeros_like(dx1)
+    A_s2 = np.zeros_like(dx2)
+
+    valid_dx1 = dx1 > 0.0
+    valid_dx2 = dx2 > 0.0
+    A_s1[valid_dx1] = V1[valid_dx1] / (2.0 * dx1[valid_dx1])
+    A_s2[valid_dx2] = V2[valid_dx2] / (2.0 * dx2[valid_dx2])
+
+    # Half-link transmissibilities
+    t1 = np.zeros_like(r_c, dtype=float)
+    t2 = np.zeros_like(r_c, dtype=float)
+
+    valid1 = (dx1 > 0.0) & (A_c > 0.0) & (A_s1 > 0.0) & (k1 > 0.0)
+    valid2 = (dx2 > 0.0) & (A_c > 0.0) & (A_s2 > 0.0) & (k2 > 0.0)
+
+    t1[valid1] = k1[valid1] * np.sqrt(A_s1[valid1] * A_c[valid1]) / dx1[valid1]
+    t2[valid2] = k2[valid2] * np.sqrt(A_s2[valid2] * A_c[valid2]) / dx2[valid2]
+
+    # Combine the two half-resistances in series:
+    # 1/conductance = 1/t1 + 1/t2
+    conductance = np.zeros_like(r_c, dtype=float)
+    valid = (t1 > 0.0) & (t2 > 0.0)
+    conductance[valid] = 1.0 / (1.0 / t1[valid] + 1.0 / t2[valid])
+
+    if return_resistance:
+        R = np.full_like(conductance, np.inf, dtype=float)
+        good = conductance > 0.0
+        R[good] = 1.0 / conductance[good]
+        return R
+
+    return conductance
 
 def bahrami_rough_joint(
     solid_p,

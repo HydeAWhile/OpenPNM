@@ -541,7 +541,7 @@ class TestThermalConductanceGoldenMaster:
                     relative_contact_radius="throat.relative_contact_throat_radius",
                     relative_bridge_radius="throat.relative_bridge_radius",
                     effective_radius="throat.effective_radius",
-                    boundary_throats="throat.boundary",
+                    boundary_pores="pore.boundary",
                     diameter="pore.diameter",
                 ),
             },
